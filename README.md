@@ -64,9 +64,13 @@ Taichi Lang（Python JIT / GPU Kernel Fusion）を用いた、土質・地盤工
   - すべてのカーネル引数は `ti.template()` で抽象化されており、データフィールド型とスカラ定数型の不一致によるGPU暗黙キャストオーバーヘッドが発生しないよう設計されています。
 
 ### (2) LAMMPS スクリプトの実行方法
-`uv run taichimps <in.script>` または `-in <in.script>` により直接実行できます。
+`taichimps <in.script>` または `-in <in.script>` により直接実行できます（デフォルトで Vulkan GPU 加速が有効）。
 ```bash
-uv run taichimps /path/to/in.script --arch vulkan --precision f32
+# Vulkan GPU 加速（デフォルト）
+uv run taichimps /path/to/in.script
+
+# 精度指定 (f32 または f64)
+uv run taichimps -in /path/to/in.script --fp f32 --arch vulkan
 ```
 
 ### (3) GGUI リアルタイム可視化
@@ -77,3 +81,26 @@ vis = Visualizer3D(domain=sim.domain, max_particles=sim.atom.nlocal, show_window
 while vis.render_frame(sim.atom):
     sim.step()
 ```
+
+---
+
+## 4. 統合GPUベンチマーク実績 (Unified GPU Benchmark: 1,000,000 Particles)
+
+AMD Ryzen AI 9 HX PRO 370 (12C/24T) + AMD Radeon 890M GPU (RDNA 3.5 UMA 75GB, Linux) における 1,000,000（100万）粒子DEM等方圧密系の統一ベンチマーク実測値です。
+
+| 実装 / エンジン | 実行環境 / バックエンド | 計算精度 | 200ステップ時間 (ms) | 1ステップ時間 (μs) | スループット (Matoms/s) | vs LAMMPS CPU (基準) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **LAMMPS C++** | CPU (Ryzen 12C/24T, OpenMPI) | Float64 | 4,399.82 ms | 21,999.10 μs | 45.46 | **1.00x** *(Baseline)* |
+| **torchmps** | GPU (Radeon 890M, PyTorch ROCm) | Float64 | 481.00 ms | 2,405.00 μs | 415.80 | **9.15x** |
+| **mojomps** | GPU (Radeon 890M, Mojo MAX GPU) | Float64 | 153.96 ms | 769.80 μs | 1,299.04 | **28.58x** |
+| **taichimps** | GPU (Radeon 890M, Taichi Vulkan) | Float64 | 151.74 ms | 758.70 μs | 1,318.04 | **28.99x** |
+| **jammps** | GPU (Radeon 890M, JAX ROCm XLA) | Float64 | 143.62 ms | 718.08 μs | 1,392.60 | **30.64x** |
+| **torchmps** | GPU (Radeon 890M, PyTorch ROCm) | Float32 | 280.69 ms | 1,403.45 μs | 712.53 | **15.68x** |
+| **jammps** | GPU (Radeon 890M, JAX ROCm XLA) | Float32 | 94.65 ms | 473.23 μs | 2,113.14 | **46.49x** |
+| **mojomps** | GPU (Radeon 890M, Mojo MAX GPU) | Float32 | 82.48 ms | 412.40 μs | 2,424.83 | **53.35x** |
+| **taichimps** | GPU (Radeon 890M, Taichi Vulkan) | Float32 | **78.49 ms** | **392.45 μs** | **2,548.10** | **56.06x (最速)** |
+
+> **今後の開発の柱：`taichimps`**
+> - **Vulkan Compute による卓越した可搬性と超高速性能**: ROCm / HIP ドライバの不安定さや外部プロセス競合を受けず、AMD Radeon 890M 上で最も安定かつ最高速（Float32 で **56.06倍高速**・ステップあたり **392 μs**）を達成。
+> - **JITカーネル融合**: 接触判定・せん断履歴更新・壁面反力・速度Verlet積分を単一GPUパスで実行し、GPUディスパッチオーバーヘッドを最小化。
+> - **Pythonエコシステムとの完全親和性**: PyTorch/NumPy連携やGGUI 3Dリアルタイム可視化が同一プロセス内で完全シームレスに動作。
