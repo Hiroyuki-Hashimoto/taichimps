@@ -27,6 +27,7 @@ from taichimps.EXTRA_FIX.nve_sphere import FixNVESphere
 from taichimps.EXTRA_FIX.print import FixPrint
 from taichimps.EXTRA_FIX.viscous_sphere import FixViscousSphere
 from taichimps.EXTRA_FIX.wall_gran import FixWallGran
+from taichimps.EXTRA_FIX.wall_gran_region import FixWallGranRegion
 from taichimps.GRANULAR.hertz_history import GranHertzHistory
 from taichimps.GRANULAR.hooke import GranHooke
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
@@ -303,14 +304,34 @@ class LAMMPSInputParser:
             elif cmd == "create_box":
                 # create_box <ntypes> <region-id>
                 # If region exists, initialize domain with it
-                reg_id = args[1] if len(args) > 1 else "box"
+                reg_id = args[1]
                 if reg_id in self.regions:
-                    b_lo, b_hi = self.regions[reg_id]
-                    self.domain = Domain(boxlo=b_lo, boxhi=b_hi)
-                    self.atom = AtomSystem(max_atoms=100000)
+                    reg_data = self.regions[reg_id]
+                    if isinstance(reg_data, tuple):
+                        b_lo, b_hi = reg_data
+                        self.domain = Domain(b_lo, b_hi)
+                        self.atom = AtomSystem(max_atoms=100000)
+                    elif isinstance(reg_data, dict):
+                        # Cylinder or other region: approximate bounding box if lo/hi provided
+                        c1, c2, r = reg_data["c1"], reg_data["c2"], reg_data["radius"]
+                        lo = reg_data["lo"] if reg_data.get("lo") is not None else -r
+                        hi = reg_data["hi"] if reg_data.get("hi") is not None else r
+                        axis = reg_data.get("axis", "z")
+                        if axis == "x":
+                            b_lo = [lo, c1 - r, c2 - r]
+                            b_hi = [hi, c1 + r, c2 + r]
+                        elif axis == "y":
+                            b_lo = [c1 - r, lo, c2 - r]
+                            b_hi = [c1 + r, hi, c2 + r]
+                        else:
+                            b_lo = [c1 - r, c2 - r, lo]
+                            b_hi = [c1 + r, c2 + r, hi]
+                        self.domain = Domain(b_lo, b_hi)
+                        self.atom = AtomSystem(max_atoms=100000)
 
             elif cmd == "region":
                 # region <id> block <xlo> <xhi> <ylo> <yhi> <zlo> <zhi>
+                # region <id> cylinder <dim> <c1> <c2> <radius> <lo> <hi> [side in|out]
                 reg_id = args[0]
                 style = args[1]
                 if style == "block" and len(args) >= 8:
@@ -321,6 +342,31 @@ class LAMMPSInputParser:
                     zlo = float(self.evaluate_expression(args[6]))
                     zhi = float(self.evaluate_expression(args[7]))
                     self.regions[reg_id] = ([xlo, ylo, zlo], [xhi, yhi, zhi])
+                elif style == "cylinder" and len(args) >= 7:
+                    axis_name = args[2].lower()
+                    c1 = float(self.evaluate_expression(args[3]))
+                    c2 = float(self.evaluate_expression(args[4]))
+                    radius = float(self.evaluate_expression(args[5]))
+                    lo = None if args[6] in ("INF", "NULL", "EDGE") else float(self.evaluate_expression(args[6]))
+                    hi = None if len(args) <= 7 or args[7] in ("INF", "NULL", "EDGE") else float(self.evaluate_expression(args[7]))
+                    side = "in"
+                    idx = 8
+                    while idx < len(args):
+                        if args[idx] == "side" and idx + 1 < len(args):
+                            side = args[idx + 1].lower()
+                            idx += 2
+                        else:
+                            idx += 1
+                    self.regions[reg_id] = {
+                        "style": "cylinder",
+                        "axis": axis_name,
+                        "c1": c1,
+                        "c2": c2,
+                        "radius": radius,
+                        "lo": lo,
+                        "hi": hi,
+                        "side": side,
+                    }
 
             elif cmd == "unfix":
                 fix_id = args[0]
@@ -522,18 +568,158 @@ class LAMMPSInputParser:
                         self.simulation.add_fix(fix_inst)
 
                 elif fix_style.startswith("wall/gran") and self.domain:
-                    # fix <id> <group> wall/gran ...
-                    fix_inst = FixWallGran(
-                        domain=self.domain,
-                        wall_axis=2,
-                        wall_side=-1,
-                        wall_coord=0.0,
-                        kn=1e5,
-                        gamman=0.0,
-                        kt=0.0,
-                        gammat=0.0,
-                        xmu=0.0,
-                    )
+                    # Parse wall/gran and wall/gran/region
+                    # fix <id> <group> wall/gran/region <fstyle> ... region <reg_id>
+                    # fix <id> <group> wall/gran <fstyle> ... <wallstyle> ...
+                    fstyle = "hooke"
+                    kn = 1e5
+                    gamman = 0.0
+                    kt = None
+                    gammat = None
+                    xmu = 0.0
+                    dampflag = 1
+                    wallstyle = None
+                    region_id = None
+                    axis_str = "z"
+                    c1 = 0.0
+                    c2 = 0.0
+                    radius = 1.0
+                    side_val = "in"
+
+                    # Parse parameters
+                    # First argument after fix_style can be fstyle or granular or wallstyle
+                    i = 0
+                    if i < len(fix_args) and fix_args[i].lower() in ("hooke", "hooke/history", "hertz", "hertz/history", "granular"):
+                        fstyle = fix_args[i].lower()
+                        i += 1
+                        # If numeric args follow: Kn, Kt, gamma_n, gamma_t, xmu, dampflag
+                        num_params = []
+                        while i < len(fix_args) and fix_args[i].lower() not in (
+                            "xplane", "yplane", "zplane", "cylinder", "zcylinder", "region"
+                        ):
+                            val_str = fix_args[i]
+                            if val_str.upper() == "NULL":
+                                num_params.append(None)
+                            else:
+                                try:
+                                    num_params.append(float(self.evaluate_expression(val_str)))
+                                except ValueError:
+                                    break
+                            i += 1
+
+                        if len(num_params) >= 1 and num_params[0] is not None:
+                            kn = num_params[0]
+                        if len(num_params) >= 2 and num_params[1] is not None:
+                            kt = num_params[1]
+                        if len(num_params) >= 3 and num_params[2] is not None:
+                            gamman = num_params[2]
+                        if len(num_params) >= 4 and num_params[3] is not None:
+                            gammat = num_params[3]
+                        if len(num_params) >= 5 and num_params[4] is not None:
+                            xmu = num_params[4]
+                        if len(num_params) >= 6 and num_params[5] is not None:
+                            dampflag = int(num_params[5])
+
+                    # Check for wallstyle or region in remaining tokens
+                    while i < len(fix_args):
+                        token = fix_args[i].lower()
+                        if token == "region" and i + 1 < len(fix_args):
+                            region_id = fix_args[i + 1]
+                            i += 2
+                        elif token in ("xplane", "yplane", "zplane"):
+                            wallstyle = token
+                            # plane params: lo hi
+                            i += 3
+                        elif token == "cylinder":
+                            wallstyle = "cylinder"
+                            # cylinder <axis> <c1> <c2> <radius>
+                            if i + 4 < len(fix_args):
+                                axis_str = fix_args[i + 1].lower()
+                                c1 = float(self.evaluate_expression(fix_args[i + 2]))
+                                c2 = float(self.evaluate_expression(fix_args[i + 3]))
+                                radius = float(self.evaluate_expression(fix_args[i + 4]))
+                                i += 5
+                            else:
+                                i += 1
+                        elif token == "zcylinder":
+                            wallstyle = "cylinder"
+                            axis_str = "z"
+                            # zcylinder <radius> [c1 c2]
+                            if i + 1 < len(fix_args):
+                                radius = float(self.evaluate_expression(fix_args[i + 1]))
+                                i += 2
+                                if i + 1 < len(fix_args) and not fix_args[i].isalpha():
+                                    c1 = float(self.evaluate_expression(fix_args[i]))
+                                    c2 = float(self.evaluate_expression(fix_args[i + 1]))
+                                    i += 2
+                            else:
+                                i += 1
+                        else:
+                            i += 1
+
+                    if region_id and region_id in self.regions:
+                        reg = self.regions[region_id]
+                        if isinstance(reg, dict) and reg.get("style") == "cylinder":
+                            fix_inst = FixWallGranRegion(
+                                domain=self.domain,
+                                axis=reg["axis"],
+                                c1=reg["c1"],
+                                c2=reg["c2"],
+                                radius=reg["radius"],
+                                side=reg.get("side", "in"),
+                                axis_lo=reg.get("lo"),
+                                axis_hi=reg.get("hi"),
+                                fstyle=fstyle,
+                                kn=kn,
+                                gamman=gamman,
+                                kt=kt,
+                                gammat=gammat,
+                                xmu=xmu,
+                                dampflag=dampflag,
+                            )
+                        else:
+                            # Default fallback or planar region
+                            fix_inst = FixWallGran(
+                                domain=self.domain,
+                                wall_axis=2,
+                                wall_side=-1,
+                                wall_coord=0.0,
+                                kn=kn,
+                                gamman=gamman,
+                                kt=kt if kt is not None else 0.0,
+                                gammat=gammat if gammat is not None else 0.0,
+                                xmu=xmu,
+                            )
+                    elif wallstyle == "cylinder":
+                        fix_inst = FixWallGranRegion(
+                            domain=self.domain,
+                            axis=axis_str,
+                            c1=c1,
+                            c2=c2,
+                            radius=radius,
+                            side=side_val,
+                            fstyle=fstyle,
+                            kn=kn,
+                            gamman=gamman,
+                            kt=kt,
+                            gammat=gammat,
+                            xmu=xmu,
+                            dampflag=dampflag,
+                        )
+                    else:
+                        # Default planar wall
+                        fix_inst = FixWallGran(
+                            domain=self.domain,
+                            wall_axis=2,
+                            wall_side=-1,
+                            wall_coord=0.0,
+                            kn=kn,
+                            gamman=gamman,
+                            kt=kt if kt is not None else 0.0,
+                            gammat=gammat if gammat is not None else 0.0,
+                            xmu=xmu,
+                        )
+
                     self.fixes[fix_id] = fix_inst
                     if self.simulation:
                         self.simulation.add_fix(fix_inst)

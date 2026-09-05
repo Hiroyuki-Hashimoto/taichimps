@@ -12,6 +12,7 @@ from taichimps.EXTRA_FIX.nve_sphere import FixNVESphere
 from taichimps.EXTRA_FIX.print import FixPrint
 from taichimps.EXTRA_FIX.viscous_sphere import FixViscousSphere
 from taichimps.EXTRA_FIX.wall_gran import FixWallGran
+from taichimps.EXTRA_FIX.wall_gran_region import FixWallGranRegion
 
 __all__ = [
     "Fix",
@@ -24,4 +25,5 @@ __all__ = [
     "FixPrint",
     "FixViscousSphere",
     "FixWallGran",
+    "FixWallGranRegion",
 ]

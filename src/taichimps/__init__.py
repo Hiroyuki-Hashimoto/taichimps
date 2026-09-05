@@ -7,11 +7,11 @@ from taichimps.computes import Computes
 from taichimps.contact_history import ContactHistory
 from taichimps.domain import Domain
 from taichimps.dump import DumpWriter
+from taichimps.input import LammpsInputParser, parse_and_run
 from taichimps.neighbor import NeighborList
+from taichimps.script_parser import ScriptParser
 from taichimps.simulation import Simulation
 from taichimps.vis.viewer import Visualizer3D
-from taichimps.input import LammpsInputParser, parse_and_run
-from taichimps.script_parser import ScriptParser
 
 __version__ = "0.1.0"
 
@@ -21,10 +21,10 @@ __all__ = [
     "ContactHistory",
     "Domain",
     "DumpWriter",
+    "LammpsInputParser",
     "NeighborList",
+    "ScriptParser",
     "Simulation",
     "Visualizer3D",
-    "LammpsInputParser",
-    "ScriptParser",
     "parse_and_run",
 ]
