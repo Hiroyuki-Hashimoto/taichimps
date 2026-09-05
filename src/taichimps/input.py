@@ -38,11 +38,12 @@ from taichimps.simulation import Simulation
 class LAMMPSInputParser:
     """Parses and executes a LAMMPS input script in taichimps."""
 
-    def __init__(self, script_path: str | Path) -> None:
+    def __init__(self, script_path: str | Path, default_fp=None) -> None:
         self.script_path = Path(script_path)
         self.workdir = self.script_path.parent
         self.variables: dict[str, Any] = {}
         self.commands: list[str] = []
+        self.default_fp = default_fp
 
         # System state
         self.domain: Domain | None = None
@@ -225,7 +226,10 @@ class LAMMPSInputParser:
     def execute(self) -> None:
         """Executes commands in sequence."""
         try:
-            ti.init(arch=ti.cpu)
+            if self.default_fp is not None:
+                ti.init(arch=ti.cpu, default_fp=self.default_fp)
+            else:
+                ti.init(arch=ti.cpu)
         except RuntimeError:
             pass
 
