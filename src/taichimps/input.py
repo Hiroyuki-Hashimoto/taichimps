@@ -572,3 +572,14 @@ class LAMMPSInputParser:
                     if self.pair_style and self.simulation.pair_style != self.pair_style:
                         self.simulation.pair_style = self.pair_style
                     self.simulation.run(nsteps)
+
+
+LammpsInputParser = LAMMPSInputParser
+
+
+def parse_and_run(script_path: str | Path) -> Simulation:
+    """Parse and run a LAMMPS script."""
+    parser = LAMMPSInputParser(script_path)
+    parser.execute()
+    return parser.simulation
+

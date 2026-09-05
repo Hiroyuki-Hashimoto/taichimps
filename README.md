@@ -47,9 +47,9 @@ Taichi Lang（Python JIT / GPU Kernel Fusion）を用いた、土質・地盤工
    - `ComputeFabric`: 接触異方性（2階ファブリックテンソル）。
    - `ComputeContactAtom`: 各粒子の配位数並列集計。
 5. **入出力 (I/O) & パーサー**:
-   - `read_data`: LAMMPS `read_data` (Sphereフォーマット) 高速パーサー。
-   - `input.py`: 変数式評価、動的参照（`${var}`, `c_1[1]`, `vol`, `lx` 等）、ループ制御（`variable loop`, `next`, `jump`）完全対応。
-   - `DumpWriter`: LAMMPS custom dump形式およびVTK出力。
+    - `read_data`: LAMMPS `read_data` (Sphereフォーマット) 高速パーサー。
+    - `input.py` / `script_parser.py`: 変数式評価、動的参照（`${var}`, `c_1[1]`, `vol`, `lx` 等）、ループ制御（`variable loop`, `next`, `jump`）完全対応。
+    - `DumpWriter`: LAMMPS custom dump形式およびVTK出力。
 6. **リアルタイム可視化**:
    - `Visualizer3D` (`taichimps.vis`): GPU Zero-Copy による Taichi GGUI (Vulkan) リアルタイム3Dビューア。
 

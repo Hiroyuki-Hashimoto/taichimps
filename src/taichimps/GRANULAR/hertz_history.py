@@ -142,8 +142,10 @@ class GranHertzHistory(GranularPair):
                     ti.atomic_add(f[j], -f_total)
 
                     tor = rinv * dpos.cross(fs_vec)
-                    ti.atomic_add(torque[i], -ri * tor)
-                    ti.atomic_add(torque[j], -rj * tor)
+                    radstep_i = ri - 0.5 * delta
+                    radstep_j = rj - 0.5 * delta
+                    ti.atomic_add(torque[i], -radstep_i * tor)
+                    ti.atomic_add(torque[j], -radstep_j * tor)
                 else:
                     partner_hist[i, k] = -1
                     shear_hist[i, k] = ti.Vector([0.0, 0.0, 0.0])
