@@ -3,6 +3,8 @@ Real-time 3D Visualizer for taichimps using Taichi GGUI (ti.ui).
 Zero-overhead, isolated visualization that does not affect LAMMPS core logic.
 """
 
+from typing import Any
+
 import numpy as np
 import taichi as ti
 
@@ -99,6 +101,7 @@ class Visualizer3D:
         particle_radius: float | None = None,
         color_by: str = "speed",
         max_speed: float = 1.0,
+        ui_callback: Any = None,
     ) -> bool:
         """
         Renders current particle configuration to the window.
@@ -148,5 +151,8 @@ class Visualizer3D:
 
         self.canvas.scene(self.scene)
         if self.show_window:
+            if ui_callback is not None:
+                gui = self.window.get_gui()
+                ui_callback(gui)
             self.window.show()
         return True

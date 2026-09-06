@@ -12,6 +12,7 @@ Includes interactive 3D GGUI visualization preview.
 import os
 import platform
 import time
+from typing import Any
 
 import numpy as np
 import taichi as ti
@@ -48,27 +49,58 @@ def run_cylindrical_triaxial_simulation(
     boxhi = [0.10, 0.10, 0.18]  # taller domain to allow rainfall from above
     domain = Domain(boxlo=boxlo, boxhi=boxhi, boundary=["f", "f", "f"])
 
-    # Atom storage in f32
-    atom = AtomSystem(max_atoms=n_particles + 500, float_type=fp_type)
+    # Atom storage in f32 (support up to n_particles + margin)
+    max_storage = max(n_particles + 1000, 35000)
+    atom = AtomSystem(max_atoms=max_storage, float_type=fp_type)
 
-    # 2. Generate rain particles inside and above cylinder (z from 0.005 up to 0.12)
-    # allowing particles to fall and settle inside the cylinder
+    # 2. Generate rain particles inside and above cylinder (z from 0.005 up to 0.17)
+    # Using jittered grid generation to avoid artificial particle overlap and explosions
     rng = np.random.default_rng(42)
     positions: list[list[float]] = []
     radii: list[float] = []
     r_particle_nominal = 0.001  # 1 mm radius = 2 mm diameter
 
-    for _ in range(n_particles):
-        rad = float(r_particle_nominal * rng.uniform(0.95, 1.05))
-        # scatter within column cross section
-        angle = float(rng.uniform(0, 2.0 * np.pi))
-        r_rand = float(np.sqrt(rng.uniform(0, 1.0)) * (r_cyl - rad - 0.001))
-        px = c_x + r_rand * np.cos(angle)
-        py = c_y + r_rand * np.sin(angle)
-        # initial distribution spanning inside and top of cylinder
-        pz = float(rng.uniform(0.01, 0.12))
-        positions.append([px, py, pz])
-        radii.append(rad)
+    if n_particles <= 300:
+        # Simple random generation for small test runs
+        for _ in range(n_particles):
+            rad = float(r_particle_nominal * rng.uniform(0.95, 1.05))
+            angle = float(rng.uniform(0, 2.0 * np.pi))
+            r_rand = float(np.sqrt(rng.uniform(0, 1.0)) * (r_cyl - rad - 0.0005))
+            px = c_x + r_rand * np.cos(angle)
+            py = c_y + r_rand * np.sin(angle)
+            pz = float(rng.uniform(0.01, 0.12))
+            positions.append([px, py, pz])
+            radii.append(rad)
+    else:
+        # Dense layered jittered grid generation for up to ~30,000 particles
+        # Spacing ~2.15 mm
+        spacing = 0.00215
+        grid_r = np.arange(-r_cyl + 0.0012, r_cyl - 0.0012, spacing)
+        # Layers up to z = 0.165m
+        z_curr = 0.002
+        while len(positions) < n_particles and z_curr < 0.170:
+            for gx in grid_r:
+                for gy in grid_r:
+                    dist_sq = gx * gx + gy * gy
+                    if dist_sq <= (r_cyl - 0.0012) ** 2:
+                        # Add jitter to prevent crystallization
+                        jx = float(rng.uniform(-0.0001, 0.0001))
+                        jy = float(rng.uniform(-0.0001, 0.0001))
+                        jz = float(rng.uniform(-0.0001, 0.0001))
+                        px = c_x + gx + jx
+                        py = c_y + gy + jy
+                        pz = z_curr + jz
+                        rad = float(r_particle_nominal * rng.uniform(0.95, 1.05))
+                        positions.append([px, py, pz])
+                        radii.append(rad)
+                        if len(positions) >= n_particles:
+                            break
+                if len(positions) >= n_particles:
+                    break
+            z_curr += spacing
+
+    actual_n = len(positions)
+    print(f"Generated {actual_n} initial particles for deposition.")
 
     # Add silica sand particles (rho = 2650 kg/m^3)
     atom.add_particles(
@@ -91,7 +123,14 @@ def run_cylindrical_triaxial_simulation(
         float_type=fp_type,
     )
 
-    nlist = NeighborList(domain=domain, skin=0.0005, max_neighbors=48, float_type=fp_type)
+    max_nl_atoms = max(max_storage, 50000)
+    nlist = NeighborList(
+        domain=domain,
+        skin=0.0005,
+        max_atoms=max_nl_atoms,
+        max_neighbors=48,
+        float_type=fp_type,
+    )
     dt = 1e-4
     sim = Simulation(
         domain=domain,
@@ -161,16 +200,26 @@ def run_cylindrical_triaxial_simulation(
             if has_display:
                 vis = Visualizer3D(
                     domain=domain,
-                    title="TaichiMPS: 4-Stage Triaxial Test (F32)",
-                    res=(1024, 768),
+                    max_particles=max_storage,
+                    title="TaichiMPS: 4-Stage Triaxial Test (F32 - 30,000 Particles)",
+                    res=(1280, 800),
                     show_window=True,
                 )
-                vis.camera.position(c_x + 0.16, c_y - 0.16, 0.14)
-                vis.camera.lookat(c_x, c_y, 0.05)
+                vis.camera.position(c_x + 0.17, c_y - 0.17, 0.15)
+                vis.camera.lookat(c_x, c_y, 0.06)
                 vis.camera.up(0, 0, 1)
         except (RuntimeError, ValueError) as e:
             print(f"[Visualizer Notice] GUI display skipped: {e}")
             vis = None
+
+    def make_overlay(title: str, sub: str, count: int, extra: str = "") -> Any:
+        def callback(gui: Any) -> None:
+            gui.text(f"=== {title} ===")
+            gui.text(f"Status: {sub}")
+            gui.text(f"Active Particles: {count}")
+            if extra:
+                gui.text(extra)
+        return callback
 
     # =========================================================================
     # STAGE 1: Gravitational Deposition (Free-fall rain into top-open cylinder)
@@ -179,13 +228,30 @@ def run_cylindrical_triaxial_simulation(
     depo_steps = 100 if not gui_preview else 600
     for step in range(depo_steps):
         sim.step()
-        if vis and (step % 20 == 0):
-            vis.render_frame(atom, color_by="speed")
+        if vis and (step % 15 == 0):
+            overlay = make_overlay(
+                "Stage 1/4: Free-fall Deposition",
+                f"Step {step}/{depo_steps}",
+                atom.nlocal,
+                "Raining into cylindrical mold (D=50mm, H=100mm)",
+            )
+            vis.render_frame(atom, color_by="speed", ui_callback=overlay)
 
     # =========================================================================
     # STAGE 2: Specimen Trimming (Cut particles outside r > 25mm or z > 100mm)
     # =========================================================================
     print("--- Stage 2: Specimen Trimming (Removing overflow particles) ---")
+    # Show trimming moment in GUI
+    if vis:
+        overlay_pre = make_overlay(
+            "Stage 2/4: Specimen Trimming",
+            "Pre-trimming (Specimen overflow)",
+            atom.nlocal,
+            "Cutting particles outside D=50mm, H=100mm...",
+        )
+        for _ in range(10):
+            vis.render_frame(atom, color_by="speed", ui_callback=overlay_pre)
+
     # Extract particles inside cylinder: r <= r_cyl and 0 <= z <= h_cyl
     pos_np = atom.x.to_numpy()[: atom.nlocal]
     dx = pos_np[:, 0] - c_x
@@ -197,10 +263,17 @@ def run_cylindrical_triaxial_simulation(
     keep_mask = (r_dist <= r_cyl) & (z_dist >= 0.0) & (z_dist <= h_cyl)
     trimmed_count = atom.filter_particles(keep_mask)
     nlist.build(atom)  # rebuild neighbor list with trimmed particles
-    print(f"Trimmed specimen particles count inside cylinder: {trimmed_count} / {n_particles}")
+    print(f"Trimmed specimen particles count inside cylinder: {trimmed_count} / {actual_n}")
 
     if vis:
-        vis.render_frame(atom, color_by="speed")
+        overlay_post = make_overlay(
+            "Stage 2/4: Specimen Trimming",
+            "Trimming Complete",
+            atom.nlocal,
+            f"Trimmed specimen ready: H0=100.0mm, D=50.0mm ({trimmed_count} particles)",
+        )
+        for _ in range(15):
+            vis.render_frame(atom, color_by="speed", ui_callback=overlay_post)
 
     # =========================================================================
     # STAGE 3: Consolidation (Target confining stress sigma_c = 30 kPa)
@@ -225,8 +298,14 @@ def run_cylindrical_triaxial_simulation(
     conso_steps = 100 if not gui_preview else 500
     for step in range(conso_steps):
         sim.step()
-        if vis and (step % 20 == 0):
-            vis.render_frame(atom, color_by="speed")
+        if vis and (step % 15 == 0):
+            overlay_conso = make_overlay(
+                "Stage 3/4: Consolidation",
+                f"Step {step}/{conso_steps}",
+                atom.nlocal,
+                "Applying confinement: sigma_c = 30.0 kPa",
+            )
+            vis.render_frame(atom, color_by="speed", ui_callback=overlay_conso)
 
     # =========================================================================
     # STAGE 4: Triaxial Shear (Compress to 20% axial strain: H -> 80 mm)
@@ -248,8 +327,14 @@ def run_cylindrical_triaxial_simulation(
         # Engineering axial strain: epsilon_a = Delta H / H0
         curr_strain = (h_initial - top_z) / h_initial
 
-        if vis and (step % 25 == 0):
-            vis.render_frame(atom, color_by="speed")
+        if vis and (step % 20 == 0):
+            overlay_shear = make_overlay(
+                "Stage 4/4: Triaxial Shear",
+                f"Step {step}/{compression_steps}",
+                atom.nlocal,
+                f"Height: {top_z * 1e3:5.1f}mm | Strain: {curr_strain * 100:5.1f}% / 20.0%",
+            )
+            vis.render_frame(atom, color_by="speed", ui_callback=overlay_shear)
             if step % 200 == 0:
                 print(f"  Step {step:4d} | Top Z: {top_z * 1e3:6.2f} mm | Axial Strain: {curr_strain * 100:5.1f}%")
 
@@ -287,10 +372,10 @@ def test_triaxial_compression_cylindrical_headless():
 
 
 if __name__ == "__main__":
-    print("=== Running 4-Stage Triaxial DEM Simulation in ti.f32 ===")
+    print("=== Running 4-Stage Triaxial DEM Simulation in ti.f32 (30,000 Particles) ===")
     ti.init(arch=ti.vulkan, default_fp=ti.f32)
     run_cylindrical_triaxial_simulation(
         gui_preview=True,
-        n_particles=300,
+        n_particles=30000,
         keep_window_open=True,
     )
