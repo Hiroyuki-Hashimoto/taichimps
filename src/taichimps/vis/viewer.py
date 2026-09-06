@@ -85,13 +85,13 @@ class Visualizer3D:
                 norm_speed = ti.min(1.0, speed / (max_speed + 1e-6))
 
                 # Jet colormap approximation (Blue -> Cyan -> Yellow -> Red)
-                r = ti.min(1.0, ti.max(0.0, 1.5 - ti.abs(norm_speed * 4.0 - 3.0)))
-                g = ti.min(1.0, ti.max(0.0, 1.5 - ti.abs(norm_speed * 4.0 - 2.0)))
-                b = ti.min(1.0, ti.max(0.0, 1.5 - ti.abs(norm_speed * 4.0 - 1.0)))
+                r = ti.cast(ti.min(1.0, ti.max(0.0, 1.5 - ti.abs(norm_speed * 4.0 - 3.0))), ti.f32)
+                g = ti.cast(ti.min(1.0, ti.max(0.0, 1.5 - ti.abs(norm_speed * 4.0 - 2.0))), ti.f32)
+                b = ti.cast(ti.min(1.0, ti.max(0.0, 1.5 - ti.abs(norm_speed * 4.0 - 1.0))), ti.f32)
                 self.render_color[i] = ti.Vector([r, g, b])
             else:
                 # Default gold particle color
-                self.render_color[i] = ti.Vector([0.9, 0.7, 0.2])
+                self.render_color[i] = ti.Vector([ti.f32(0.9), ti.f32(0.7), ti.f32(0.2)])
 
     def render_frame(
         self,

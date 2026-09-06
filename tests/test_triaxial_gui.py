@@ -15,6 +15,7 @@ Specimen dimensions:
 """
 
 import os
+import platform
 
 import numpy as np
 import pytest
@@ -36,6 +37,7 @@ def run_cylindrical_triaxial_simulation(
     gui_preview: bool = False,
     max_steps: int = 100,
     n_particles: int = 250,
+    keep_window_open: bool = False,
 ):
     """
     Run cylindrical triaxial compression simulation.
@@ -181,8 +183,10 @@ def run_cylindrical_triaxial_simulation(
     vis = None
     if gui_preview:
         try:
-            # show_window True if display server present, otherwise headless fallback
-            has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            # On Windows, always show window. On Linux, check DISPLAY/WAYLAND_DISPLAY.
+            is_windows = platform.system() == "Windows"
+            has_display = is_windows or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            print(f"[Visualizer] Initializing GGUI 3D Window (show_window={has_display})...")
             vis = Visualizer3D(
                 domain=domain,
                 max_particles=max_atoms,
@@ -194,6 +198,7 @@ def run_cylindrical_triaxial_simulation(
             vis.camera.position(c_x + 0.15, c_y + 0.15, 0.08)
             vis.camera.lookat(c_x, c_y, 0.05)
             vis.camera.up(0, 0, 1)
+            print("[Visualizer] 3D Window ready.")
         except (RuntimeError, ValueError) as e:
             print(f"[Visualizer Notice] GUI display initialization skipped: {e}")
             vis = None
@@ -208,6 +213,10 @@ def run_cylindrical_triaxial_simulation(
     axial_strains = []
     top_positions = []
 
+    # Initial render frame before stepping so the window immediately appears
+    if vis is not None:
+        vis.render_frame(atom=atom)
+
     for step in range(max_steps):
         # Update top platen position downwards for axial compression
         fix_top.wall_coord -= v_top_down * dt
@@ -218,12 +227,21 @@ def run_cylindrical_triaxial_simulation(
         axial_strains.append(axial_strain)
         top_positions.append(fix_top.wall_coord)
 
-        # GGUI 3D rendering preview
-        if vis is not None:
-            # Render particles
+        # Periodic status report
+        if (step + 1) % 50 == 0 or step == 0:
+            print(f"[Step {step+1:4d}/{max_steps}] Axial strain: {axial_strain*100:.2f}%, Top z: {fix_top.wall_coord*1e3:.2f} mm")
+
+        # GGUI 3D rendering preview (render every 2 steps to reduce overhead)
+        if vis is not None and (step % 2 == 0 or step == max_steps - 1):
             is_running = vis.render_frame(atom=atom)
             if not is_running:
+                print("[Visualizer] Window closed by user.")
                 break
+
+    if vis is not None and keep_window_open and vis.show_window:
+        print("[Visualizer] Simulation finished. Window is kept open (press ESC or close window to exit)...")
+        while vis.render_frame(atom=atom):
+            pass
 
     return {
         "n_particles": atom.nlocal,
@@ -263,7 +281,8 @@ if __name__ == "__main__":
 
     res = run_cylindrical_triaxial_simulation(
         gui_preview=True,
-        max_steps=500,
+        max_steps=5000,
         n_particles=300,
+        keep_window_open=True,
     )
     print(f"Triaxial test preview finished: {res}")
