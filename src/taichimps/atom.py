@@ -136,6 +136,60 @@ class AtomSystem:
 
         self.nlocal = end
 
+    def filter_particles(self, keep_mask: np.ndarray) -> int:
+        """Keep only particles where keep_mask is True, compacting the arrays.
+
+        Args:
+            keep_mask: 1D boolean numpy array of length nlocal.
+
+        Returns:
+            The new particle count nlocal.
+        """
+        keep_indices = np.where(keep_mask[: self.nlocal])[0]
+        n_kept = len(keep_indices)
+        if n_kept == self.nlocal:
+            return self.nlocal
+
+        curr_x = self.x.to_numpy()
+        curr_v = self.v.to_numpy()
+        curr_omega = self.omega.to_numpy()
+        curr_f = self.f.to_numpy()
+        curr_torque = self.torque.to_numpy()
+        curr_rad = self.radius.to_numpy()
+        curr_rmass = self.rmass.to_numpy()
+        curr_type = self.atom_type.to_numpy()
+        curr_tag = self.tag.to_numpy()
+        curr_mask = self.mask.to_numpy()
+
+        # Compact kept particles to start
+        curr_x[:n_kept] = curr_x[keep_indices]
+        curr_v[:n_kept] = curr_v[keep_indices]
+        curr_omega[:n_kept] = curr_omega[keep_indices]
+        curr_f[:n_kept] = 0.0
+        curr_torque[:n_kept] = 0.0
+        curr_rad[:n_kept] = curr_rad[keep_indices]
+        curr_rmass[:n_kept] = curr_rmass[keep_indices]
+        curr_type[:n_kept] = curr_type[keep_indices]
+        curr_tag[:n_kept] = curr_tag[keep_indices]
+        curr_mask[:n_kept] = 1
+
+        # Clear tail
+        curr_mask[n_kept:] = 0
+
+        self.x.from_numpy(curr_x)
+        self.v.from_numpy(curr_v)
+        self.omega.from_numpy(curr_omega)
+        self.f.from_numpy(curr_f)
+        self.torque.from_numpy(curr_torque)
+        self.radius.from_numpy(curr_rad)
+        self.rmass.from_numpy(curr_rmass)
+        self.atom_type.from_numpy(curr_type)
+        self.tag.from_numpy(curr_tag)
+        self.mask.from_numpy(curr_mask)
+
+        self.nlocal = n_kept
+        return self.nlocal
+
     @ti.kernel
     def clear_forces(self):
         """Zero out forces and torques at start of timestep."""

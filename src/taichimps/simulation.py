@@ -66,6 +66,7 @@ class Simulation:
         )
 
         self.pair_style: GranularPair | None = pair
+        self.integrator: FixNVESphere | None = None
         self.fixes: list[Fix] = []
         self.dumps: list[tuple[DumpWriter, int]] = []
         self.thermo_freq = thermo_freq
@@ -85,6 +86,13 @@ class Simulation:
             self.integrator = fix
         else:
             self.fixes.append(fix)
+
+    def remove_fix(self, fix: Fix) -> None:
+        """Remove a fix from active simulation fixes."""
+        if fix in self.fixes:
+            self.fixes.remove(fix)
+        elif self.integrator is fix:
+            self.integrator = None
 
     def init_simulation(self) -> None:
         """Initialize forces for the first timestep if not already done."""
