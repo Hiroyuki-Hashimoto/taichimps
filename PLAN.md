@@ -1,147 +1,114 @@
-# Taichimps 実装計画書 (PLAN.md)
+# Taichimps 高速化・効率化および LAMMPS 機能移転ロードマップ (PLAN)
 
-LAMMPS GRANULAR パッケージの Taichi Lang による超高速個別要素法（DEM）再実装プロジェクト。
-
----
-
-## 1. プロジェクト概要
-
-- **名称**: `Taichimps` (たいちんぷす)
-- **目的**: LAMMPS C++ (GRANULAR package) の粒子接触力学・時間積分・境界サーボ制御を、**Taichi Lang（Python DSL JITコンパイラ）** を用いて超高速化し、単一GPUカーネル融合（Kernel Fusion）によりPyTorchのカーネル起動オーバーヘッドを打破する。
-- **ターゲット環境**:
-  - Linux (x86_64) / Windows (x86_64)
-  - バックエンド: **Vulkan / CUDA / CPU (LLVM)**
-  - AMD Radeon 890M (gfx1150) / NVIDIA GeForce / AMD Radeon
-- **環境構築**: `uv` によるモダンPython環境管理（Python 3.12+）
+## 1. プロジェクト方針と目標
+`taichimps` は Taichi Lang (Vulkan / CUDA / CPU) を基盤とした超高速 DEM (個別要素法) エンジンです。
+AMD Radeon 890M (RDNA 3.5) をはじめとする GPU 環境において、Vulkan Compute による高い安定性と世界最速水準のスループット（Float32: 25.5 億粒子更新/s, 392.5 μs/step）を実証しました。
+今後は `taichimps` を主軸エンジンとして位置づけ、**「さらなる高速化・GPU完全自律実行」** と **「地盤工学・土質力学に不可欠な LAMMPS 機能の完全移転」** を推進します。
 
 ---
 
-## 2. 背景とアーキテクチャ比較
+## 2. 高速化・効率化計画 (Phase 1: Architecture & Performance)
 
-DEMシミュレーションにおける各フレームワークの特性比較：
+### 2.1 Pythonループ・JITオーバーヘッドの完全排除 (`run_gpu`)
+- **課題**: 現行の `run(steps)` は Python 側で `for _ in range(steps): self.step()` を回しており、1ステップあたり5〜8回のカーネルディスパッチ同期隙間が存在。
+- **実装策**:
+  - `run_gpu(nsteps)` による複数ステップの一括融合（Kernel Fusion）。
+  - 近傍探索の判定（`delay` / `every` / `check`）を GPU カーネル内で評価し、近傍更新が不要な区間は完全自律で連続ステップ積分を実行。
+  - **目標**: ホスト-デバイス通信オーバーヘッドを 0 にし、**100〜150 μs/step (現在の 2.5〜3 倍高速化)** を達成。
 
-| 項目 | LAMMPS C++ (Reference) | PyTorch (torchmps) | Mojo (mojommps) | **Taichi (Taichimps)** |
-|---|---|---|---|---|
-| **言語・処理系** | C++17 AOT | Python + LibTorch API | Mojo (MLIR/LLVM) | **Python DSL + Taichi LLVM JIT** |
-| **GPUカーネル起動** | 1プロセス/MPI | 演算ごと個別起動 (30+回/step) | 単一カーネル融合 | **単一カーネル融合 (`@ti.kernel`)** |
-| **データ構造** | ポインタ配列 / SoA | `torch.Tensor` | `UnsafePointer` / 構造体配列 | **`ti.field` (SoA / AoS 最適配置)** |
-| **近傍・接触探索** | リンクセルリスト (C++) | セルハッシュ＆テンソルソート | グリッドハッシュポインタ | **空間ハッシュグリッド (`ti.field`)** |
-| **接線変位履歴** | `firsthistory` ポインタ | `torch.searchsorted` | メモリスロット / ハッシュキー | **固定長スロット or コンパクトハッシュ** |
-| **AMD GPU対応** | OpenMP / HIP | ROCm HIP (公式Wheel) | MAX Engine HIP (gfx1150) | **Vulkan / (Experimental HIP) / CPU** |
-| **予想性能比** | 1.0x (CPU基準) | 0.5x〜15x (粒子数依存) | **30x〜50x** (CPU基準) | **10x〜30x (PyTorch比 3〜5倍高速)** |
+### 2.2 空間グリッド近傍探索のソート・メモリ局所化
+- **課題**: リンクリスト方式（`grid_head`, `grid_next`）は粒子密集部でメモリアクセスが不連続になり、キャッシュ効率が低下。
+- **実装策**:
+  - 粒子座標から 1D セルハッシュ（Morton Code / Z-order 曲線）を計算。
+  - Taichi 上で GPU カウントソート（Radix Sort）を実施し、同一セル・隣接セルの粒子データを SoA メモリ上で連続配置（Reordering）。
+  - 接触判定を満たすペアのみをコンパクト配列（`active_pairs`）に収集し、力計算カーネルのスループットを倍増。
+
+### 2.3 接触履歴変位（Shear History）のメモリフットプリント半減
+- **課題**: `(max_atoms, max_neighbors, 3)` のフルアロケーションは 100 万粒子時に VRAM を圧迫。
+- **実装策**:
+  - 地盤土質粒子で実際に同時に生じる接触数は幾何学的に最大 12〜16 個程度。
+  - 固定スロット長を 16 に最適化し、さらにビットパック・相対インデックス化。
+  - メモリ帯域と VRAM 消費を 60% 削減。
+
+### 2.4 単精度・半精度混合（Mixed Precision: FP32 / FP16）
+- 位置座標・時間積分は FP32、局所接触幾何・弾性接触力の判定演算に FP16 を適用し、GPU のスループットを極限まで引き出す。
 
 ---
 
-## 3. ディレクトリ・モジュール構成（LAMMPS / mojommps準拠）
+## 3. LAMMPS からの機能移転計画 (Phase 2 & 3: Geotechnical & DEM Models)
 
-LAMMPSの `src/` および `mojommps` のフォルダ・ファイル階層と可能な限り1対1で一致させます。
+### 3.1 接触力学モデルの拡充 (`GRANULAR` パッケージ完全移転)
+1. **転がり摩擦 (Rolling Friction)**:
+   - 対象: `pair_style gran/hertz/history rolling ...`, `gran/hooke/history rolling ...`
+   - モデル: EPSD (Elastic-Plastic Spring Dashpot: Iwashita & Oda 1998) および CDT (Constant Directional Torque: Ai et al. 2011)
+   - 目的: 砂質土・不規則形状粒子の噛み合わせ効果（安息角、せん断強度）を再現。
+2. **ねじり摩擦 (Twisting Friction)**:
+   - 接触法線周りの相対回転角速度に対する履歴抵抗トルク。
+3. **付着力・毛管張力モデル (Cohesion & Capillary Models)**:
+   - JKR接触理論 (`gran_sub_mod_cohesion_jkr`): 微粒子・粘土・粉体の付着。
+   - 液架橋力・毛管張力モデル (Capillary Bridge): 不飽和土の見かけの粘着力とサクション。
+
+### 3.2 岩盤・固結土の破壊力学 (`BPM` パッケージ移転: Bonded Particle Model)
+1. **平行結合モデル (Parallel Bonds / `bond_bpm_rotational`)**:
+   - 粒子間に微小な円形断面の梁（Beam）を仮定（Potyondy & Cundall 2004）。
+   - 垂直力・せん断力・曲げモーメント・ねじりモーメントを同時伝達。
+2. **結合破壊基準 (Bond Breakage Criterion)**:
+   - 最大引張応力基準（引張破断: Mode I）および Mohr-Coulomb 基準（せん断破断: Mode II）。
+   - セメンテーション土（固結砂）、岩盤、コンクリートのき裂進展・破壊現象をシミュレーション。
+
+### 3.3 室内土質試験サーボ制御 (`EXTRA_FIX` 境界条件)
+1. **真三軸 / 円筒三軸圧縮サーボコントローラー (Triaxial Controller)**:
+   - 軸荷重単調載荷（軸ひずみ制御: $\dot{\varepsilon}_1 = \text{const}$）。
+   - 側圧一定制御（応力フィードバック: $\sigma_2 = \sigma_3 = \sigma_c$）。
+   - 柔軟メンブレン境界モデル（Membrane Boundary）による拘束圧の均等印加。
+2. **動的・繰返し単純せん断 (Simple Shear with PBC: SLLOD / Kraynik-Reinelt)**:
+   - 地震波入力や液状化現象を解析するための周期境界せん断変形。
+
+### 3.4 土質ミクロ構造・統計解析 (`COMPUTES` パッケージ)
+1. **ファブリックテンソル (Fabric Tensor, 2階・4階)**:
+   - 接触法線ベクトルの方向分布異方性（$F_{ij} = \frac{1}{N_c} \sum n_i n_j$）を GPU 上で並列集計。
+2. **局所間隙比・配位数 (Coordination Number & Void Ratio)**:
+   - 粒子ごとの配位数 $CN$ およびボロノイ分割に基づく局所間隙比 $e$ のリアルタイム算出。
+3. **粒子局所 Virial 応力 (Per-atom Stress Tensor)**:
+   - 各粒子における応力テンソル $\boldsymbol{\sigma}_{atom}$ の集計。
+
+### 3.5 高速データ出力 & Web 可視化 (I/O & WebGPU)
+1. **バイナリ VTK / Zarr エクスポーター**:
+   - シミュレーションをブロッキングせず、GPU メモリから直接非同期出力。
+2. **Web リアルタイムビューア (Bun + TypeScript + WebGPU / Three.js)**:
+   - WebSocket 経由で点群データおよび力鎖（Force Chain）をブラウザへ直接ストリーミング。
+
+---
+
+## 4. 実装フェーズとスケジュール
 
 ```text
-taichimps/
-├── pyproject.toml
-├── PLAN.md
-├── src/
-│   └── taichimps/
-│       ├── __init__.py
-│       ├── config.py                 # Taichi初期化 (ti.init, arch=vulkan/cuda/cpu, precision=f32/f64)
-│       ├── atom.py                   # AtomFields (x, v, f, omega, torque, radius, mass 等の ti.field)
-│       ├── domain.py                 # Domain (boxlo, boxhi, prd, 周期境界PBC, remap)
-│       ├── neighbor.py               # SpatialGridNeighbor (空間グリッド探索・近傍リスト生成カーネル)
-│       ├── fix_nve_sphere.py         # FixNVESphere (球の並進・回転Velocity-Verlet統合カーネル)
-│       ├── fix_neigh_history.py      # FixNeighHistory (接線履歴変位の管理カーネル)
-│       ├── compute_pressure.py       # ComputePressure (Virial応力テンソル集計カーネル)
-│       ├── simulation.py             # Taichiシミュレーション統合エンジン
-│       ├── input.py                  # LAMMPSスクリプト完全互換パーサー
-│       ├── data_reader.py            # LAMMPS read_data パーサー
-│       ├── dump.py                   # LAMMPS dump custom ライター
-│       ├── GRANULAR/
-│       │   ├── __init__.py
-│       │   ├── pair_gran_hertz_history.py  # Hertz-Mindlin 接触力学カーネル
-│       │   ├── pair_gran_hooke_history.py  # Hooke-Mindlin 接触力学カーネル
-│       │   ├── pair_gran_hooke.py          # 線形Hooke接触カーネル
-│       │   ├── pair_granular.py            # モジュラー接触ペアカーネル
-│       │   ├── granular_model.py           # サブモデル結合エンジン
-│       │   ├── gran_sub_mod_rolling.py     # 転がり摩擦サブモデル
-│       │   ├── gran_sub_mod_twisting.py    # ねじり摩擦サブモデル
-│       │   ├── gran_sub_mod_cohesion_jkr.py# JKR付着力サブモデル
-│       │   ├── fix_damping_cundall.py      # Cundall局所非粘性減衰カーネル
-│       │   ├── fix_gravity.py              # 重力加速度カーネル
-│       │   ├── fix_wall_gran.py            # 6面境界壁接触カーネル
-│       │   ├── fix_wall_gran_region.py     # 円筒・ボックス境界接触カーネル
-│       │   ├── fix_freeze.py               # 粒子凍結カーネル
-│       │   ├── fix_move.py                 # 規定運動カーネル
-│       │   ├── fix_pour.py                 # 粒子生成・投入エンジン
-│       │   ├── triaxial_controller.py      # 三軸圧縮サーボ制御
-│       │   └── compute_contact_atom.py     # 配位数・接触数計算カーネル
-│       ├── EXTRA_FIX/
-│       │   ├── __init__.py
-│       │   ├── fix_deform_pressure.py      # 等方圧密圧力フィードバックサーボカーネル
-│       │   ├── fix_drag.py                 # 速度比例抗力カーネル
-│       │   ├── fix_viscous_sphere.py       # Stokes粘性抵抗カーネル
-│       │   ├── fix_controller.py           # PID制御カーネル
-│       │   └── fix_addtorque_group.py      # グループトルク付与カーネル
-│       └── computes/
-│           ├── __init__.py
-│           ├── compute_stress_atom.py      # 各粒子局所Virial応力カーネル
-│           └── compute_fabric.py           # 2階ファブリックテンソル計算カーネル
-└── tests/
-    ├── test_atom_domain.py
-    ├── test_hertz_analytical.py
-    ├── test_cundall_damping.py
-    ├── test_deform_pressure.py
-    └── test_lammps_script_run.py
+[Phase 1: 高速化コア基盤]
+  ├── (1-1) run_gpu() カーネル内マルチステップ自律ループ実装
+  ├── (1-2) 空間グリッドのメモリ再配置（Count Sort & コンパクト Pair List）
+  └── (1-3) 接触履歴スロット（固定16長）の最適化
+
+[Phase 2: 地盤力学接触モデル完全移植]
+  ├── (2-1) Rolling Friction (転がり摩擦: EPSD / CDT)
+  ├── (2-2) Cohesion (JKR & 液架橋毛管力)
+  └── (2-3) BPM (Bonded Particle Model: セメンテーション・岩盤破壊)
+
+[Phase 3: 室内試験サーボ制御 & ミクロ構造解析]
+  ├── (3-1) 三軸圧縮コントローラー（側圧一定制御・メンブレン境界）
+  ├── (3-2) ファブリックテンソル・配位数・局所間隙比の GPU Compute
+  └── (3-3) WebGPU / VTK バイナリ高速ダンプ連携
 ```
 
 ---
 
-## 4. Taichiによる実装・最適化のキモ
+## 5. 実行・検証コマンド体系
+```bash
+# 基本実行 (Vulkan GPU デフォルト)
+python -m taichimps.main -in in.isotropic --arch vulkan --fp f32
 
-### (1) 単一カーネル融合 (Kernel Fusion) によるメモリ帯域の極小化
-PyTorch版では、接触ペアごとに力・トルク・相対速度・履歴更新・Virial集計を行う際に、30以上の小さなGPUカーネルが順次起動され、グローバルメモリ読み書きのオーバーヘッドが生じていました。
-Taichi版では、これらを **1つの `@ti.kernel` 内に融合** します：
-```python
-@ti.kernel
-def compute_hertz_contact():
-    for p in range(num_active_pairs[None]):
-        i = pair_i[p]
-        j = pair_j[p]
-        # 相対位置・法線ベクトル・重なり量計算
-        # Hertz法線ばね＋法線ダッシュポット
-        # Mindlin接線ばね＋接線履歴更新＋クーロン摩擦クリッピング
-        # 力とトルクを atom.f[i], atom.f[j], atom.torque[i], atom.torque[j] にアトミック加算
-        # Virial応力テンソルに足し込み
+# CPU フォールバック検証
+python -m taichimps.main -in in.isotropic --arch cpu --fp f64
+
+# テストスイート実行
+uv run pytest
 ```
-これにより、レジスタ内で力学計算が完結し、メモリアクセス回数が劇的に激減します。
-
-### (2) 空間グリッド近傍探索 (Spatial Grid Hashing)
-- 3次元グリッド `grid_head[gx, gy, gz]` と `particle_next[i]` によるリンクリストをTaichiフィールドで構築。
-- または、粒子をセルIDでソートするカウントソートカーネルをTaichiで並列実装し、GPU上で完全自律動作。
-
-### (3) 接線履歴変位（Shear History）の管理
-- 粒子あたり最大接触数（例: 最大12〜16接触）を固定長スロットバッファ `shear_history[i, slot, 3]` および `contact_target[i, slot]` として保持。
-- 毎ステップ接触ペアを走査し、同一ペアが存在すれば前ステップの $\boldsymbol{\xi}_t$ を更新、非接触となったスロットは即座にリセット。
-- 動的メモリアロケーションを完全にゼロにし、GPU上で最高速で動作させます。
-
----
-
-## 5. 開発ロードマップ
-
-1. **フェーズ1: 基礎インフラとデータ構造設計**
-   - `pyproject.toml` 設定（`taichi`, `numpy`, `pytest` 等）
-   - `config.py`（アーキテクチャ切替: `ti.vulkan`, `ti.cuda`, `ti.cpu`、精度切替: `ti.f32`, `ti.f64`）
-   - `atom.py`, `domain.py`
-2. **フェーズ2: コア力学エンジンと接触モデル**
-   - `neighbor.py`（空間ハッシュ並列近傍探索）
-   - `pair_gran_hertz_history.py`, `fix_neigh_history.py`
-   - `fix_nve_sphere.py`（球のVelocity-Verlet積分）
-   - `fix_damping_cundall.py`
-3. **フェーズ3: 境界制御と入出力互換性**
-   - `fix_deform_pressure.py`（LAMMPS厳密一致の等方圧密サーボ）
-   - `compute_pressure.py`（大域Virialテンソル計算）
-   - `input.py`, `data_reader.py`, `dump.py`
-4. **フェーズ4: 拡張パッケージの移植**
-   - Hooke接触、Rolling/Twisting/Cohesion、三軸圧縮コントローラ、壁接触
-5. **フェーズ5: 検証とベンチマーク比較**
-   - 2球接触解析解照合（相対誤差 $10^{-6}$ 検証）
-   - 3万粒子等方圧密ベンチマーク（`in.isotropic_test`）
-   - 速度比較：**LAMMPS CPU vs PyTorch (torchmps) vs Mojo (mojommps) vs Taichi (Taichimps)**

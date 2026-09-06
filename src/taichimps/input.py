@@ -8,7 +8,7 @@ import math
 import re
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import taichi as ti
@@ -28,6 +28,10 @@ from taichimps.EXTRA_FIX.print import FixPrint
 from taichimps.EXTRA_FIX.viscous_sphere import FixViscousSphere
 from taichimps.EXTRA_FIX.wall_gran import FixWallGran
 from taichimps.EXTRA_FIX.wall_gran_region import FixWallGranRegion
+from taichimps.EXTRA_TAICHI.probe import FixProbe
+from taichimps.EXTRA_TAICHI.sponge import WinSponge
+from taichimps.EXTRA_TAICHI.triaxial import FixTriaxial
+from taichimps.EXTRA_TAICHI.wave import FixWave
 from taichimps.GRANULAR.hertz_history import GranHertzHistory
 from taichimps.GRANULAR.hooke import GranHooke
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
@@ -316,7 +320,16 @@ class LAMMPSInputParser:
                     if isinstance(reg_data, tuple):
                         b_lo, b_hi = reg_data
                         self.domain = Domain(b_lo, b_hi)
-                        self.atom = AtomSystem(max_atoms=100000)
+                        self.atom = AtomSystem(max_atoms=100000, float_type=self.default_fp or ti.f64)
+                        # Add a default particle at box center
+                        self.atom.add_particles(
+                            x=[[0.5 * (b_lo[0] + b_hi[0]), 0.5 * (b_lo[1] + b_hi[1]), 0.5 * (b_lo[2] + b_hi[2])]],
+                            v=[[0.0, 0.0, 0.0]],
+                            omega=[[0.0, 0.0, 0.0]],
+                            radius=[0.5],
+                            density=1000.0,
+                            atom_type=1,
+                        )
                     elif isinstance(reg_data, dict):
                         # Cylinder or other region: approximate bounding box if lo/hi provided
                         c1, c2, r = reg_data["c1"], reg_data["c2"], reg_data["radius"]
@@ -573,6 +586,234 @@ class LAMMPSInputParser:
                     if self.simulation:
                         self.simulation.add_fix(fix_inst)
 
+                elif fix_style in ("wave", "wave/source") and self.domain:
+                    # fix <id> <group> wave [axis <x|y|z>] [f0 <float>] [t0 <float>] [amplitude <float>] [waveform <ricker|sine|pulse>] [mode <force|velocity>] [region <id>]
+                    axis = "z"
+                    f0 = 100.0
+                    t0 = None
+                    amplitude = 1.0
+                    waveform = "ricker"
+                    mode = "force"
+                    region = None
+                    i = 0
+                    while i < len(fix_args):
+                        opt = fix_args[i].lower()
+                        if opt in ("axis", "x", "y", "z"):
+                            if opt in ("x", "y", "z"):
+                                axis = opt
+                                i += 1
+                            elif i + 1 < len(fix_args):
+                                axis = fix_args[i + 1]
+                                i += 2
+                        elif opt in ("ricker", "sine", "pulse", "gaussian"):
+                            waveform = opt
+                            i += 1
+                        elif opt in ("f0", "freq") and i + 1 < len(fix_args):
+                            f0 = float(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        elif opt == "t0" and i + 1 < len(fix_args):
+                            t0 = float(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        elif opt in ("amplitude", "amp") and i + 1 < len(fix_args):
+                            amplitude = float(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        elif opt == "waveform" and i + 1 < len(fix_args):
+                            waveform = fix_args[i + 1].lower()
+                            i += 2
+                        elif opt == "mode" and i + 1 < len(fix_args):
+                            mode = fix_args[i + 1].lower()
+                            i += 2
+                        elif opt == "region" and i + 1 < len(fix_args):
+                            reg_id = fix_args[i + 1]
+                            if reg_id in self.regions:
+                                reg_val = self.regions[reg_id]
+                                if isinstance(reg_val, tuple):
+                                    region = reg_val[0] + reg_val[1]
+                            i += 2
+                        else:
+                            i += 1
+
+                    fix_inst = FixWave(
+                        domain=self.domain,
+                        float_type=self.default_fp or ti.f64,
+                        axis=axis,
+                        waveform=waveform,
+                        f0=f0,
+                        t0=t0,
+                        amplitude=amplitude,
+                        mode=mode,
+                        region=region,
+                    )
+                    self.fixes[fix_id] = fix_inst
+                    if self.simulation:
+                        self.simulation.add_fix(fix_inst)
+
+                elif fix_style in ("sponge", "winsponge", "sponge/boundary") and self.domain:
+                    # fix <id> <group> sponge [thick|thickness <float>] [eta|eta_max <float>] [window <polynomial|hann>] [power <float>]
+                    thickness = 1.0
+                    eta_max = 50.0
+                    window = "polynomial"
+                    power = 2.0
+                    boundaries = None
+                    idx = 0
+                    while idx < len(fix_args):
+                        opt = fix_args[idx].lower()
+                        if opt in ("thick", "thickness") and idx + 1 < len(fix_args):
+                            thickness = float(self.evaluate_expression(fix_args[idx + 1]))
+                            idx += 2
+                        elif opt in ("eta", "eta_max") and idx + 1 < len(fix_args):
+                            eta_max = float(self.evaluate_expression(fix_args[idx + 1]))
+                            idx += 2
+                        elif opt == "window" and idx + 1 < len(fix_args):
+                            window = fix_args[idx + 1].lower()
+                            idx += 2
+                        elif opt == "power" and idx + 1 < len(fix_args):
+                            power = float(self.evaluate_expression(fix_args[idx + 1]))
+                            idx += 2
+                        elif opt in ("boundaries", "faces") and idx + 1 < len(fix_args):
+                            boundaries = fix_args[idx + 1].split(",")
+                            idx += 2
+                        else:
+                            try:
+                                thickness = float(self.evaluate_expression(opt))
+                                idx += 1
+                            except (ValueError, TypeError):
+                                idx += 1
+
+                    fix_inst = WinSponge(
+                        domain=self.domain,
+                        float_type=self.default_fp or ti.f64,
+                        thickness=thickness,
+                        eta_max=eta_max,
+                        power=power,
+                        window=window,
+                        boundaries=boundaries,
+                    )
+                    self.fixes[fix_id] = fix_inst
+                    if self.simulation:
+                        self.simulation.add_fix(fix_inst)
+
+                elif fix_style in ("probe", "ave/probe", "wave/probe") and self.domain:
+                    # fix <id> <group> probe <nevery> [points x1,y1,z1;x2,y2,z2] [radius <r>] [file <path>]
+                    # OR fix <id> <group> probe <nevery> <x1> <y1> <z1> [radius <r>] [file <path>]
+                    nevery = int(self.evaluate_expression(fix_args[0]))
+                    radius = 1.0
+                    points_list = []
+                    filepath = None
+                    i = 1
+                    # Check if next 3 args are raw coordinates: x y z
+                    if len(fix_args) >= 4:
+                        try:
+                            x0 = float(self.evaluate_expression(fix_args[1]))
+                            y0 = float(self.evaluate_expression(fix_args[2]))
+                            z0 = float(self.evaluate_expression(fix_args[3]))
+                            points_list.append([x0, y0, z0])
+                            i = 4
+                        except (ValueError, TypeError):
+                            pass
+                    while i < len(fix_args):
+                        opt = fix_args[i].lower()
+                        if opt in ("radius", "r") and i + 1 < len(fix_args):
+                            radius = float(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        elif opt in ("file", "out") and i + 1 < len(fix_args):
+                            filepath = self.workdir / fix_args[i + 1]
+                            i += 2
+                        elif opt in ("points", "pts") and i + 1 < len(fix_args):
+                            pts_str = fix_args[i + 1]
+                            for pstr in pts_str.split(";"):
+                                coords = [float(c) for c in pstr.split(",")]
+                                if len(coords) == 3:
+                                    points_list.append(coords)
+                            i += 2
+                        elif opt in ("every", "nevery") and i + 1 < len(fix_args):
+                            nevery = int(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        else:
+                            i += 1
+
+                    if not points_list and len(fix_args) >= 4:
+                        # Check if coordinates were passed directly: probe <nevery> <x> <y> <z> ...
+                        try:
+                            px = float(self.evaluate_expression(fix_args[1]))
+                            py = float(self.evaluate_expression(fix_args[2]))
+                            pz = float(self.evaluate_expression(fix_args[3]))
+                            points_list = [[px, py, pz]]
+                        except (ValueError, TypeError):
+                            pass
+
+                    if not points_list:
+                        # Default center point
+                        cx = 0.5 * (self.domain.boxlo[0] + self.domain.boxhi[0])
+                        cy = 0.5 * (self.domain.boxlo[1] + self.domain.boxhi[1])
+                        cz = 0.5 * (self.domain.boxlo[2] + self.domain.boxhi[2])
+                        points_list = [[cx, cy, cz]]
+
+                    fix_inst = FixProbe(
+                        domain=self.domain,
+                        float_type=self.default_fp or ti.f64,
+                        points=points_list,
+                        radius=radius,
+                        nevery=nevery,
+                        file=filepath,
+                    )
+                    self.fixes[fix_id] = fix_inst
+                    if self.simulation:
+                        self.simulation.add_fix(fix_inst)
+
+                elif fix_style in ("triaxial", "triax/servo") and self.domain:
+                    # fix <id> <group> triaxial [target_stress sx sy sz] [strain_rate ex ey ez] [stress_mask mx my mz]
+                    target_stress = [-100.0e3, -100.0e3, -100.0e3]
+                    strain_rate = [0.0, 0.0, 0.0]
+                    stress_mask = [1, 1, 1]
+                    stress_damping = 0.5
+                    max_velocity = 0.1
+                    i = 0
+                    while i < len(fix_args):
+                        opt = fix_args[i].lower()
+                        if opt == "target_stress" and i + 3 < len(fix_args):
+                            target_stress = [
+                                float(self.evaluate_expression(fix_args[i + 1])),
+                                float(self.evaluate_expression(fix_args[i + 2])),
+                                float(self.evaluate_expression(fix_args[i + 3])),
+                            ]
+                            i += 4
+                        elif opt == "strain_rate" and i + 3 < len(fix_args):
+                            strain_rate = [
+                                float(self.evaluate_expression(fix_args[i + 1])),
+                                float(self.evaluate_expression(fix_args[i + 2])),
+                                float(self.evaluate_expression(fix_args[i + 3])),
+                            ]
+                            i += 4
+                        elif opt == "stress_mask" and i + 3 < len(fix_args):
+                            stress_mask = [
+                                int(self.evaluate_expression(fix_args[i + 1])),
+                                int(self.evaluate_expression(fix_args[i + 2])),
+                                int(self.evaluate_expression(fix_args[i + 3])),
+                            ]
+                            i += 4
+                        elif opt == "stress_damping" and i + 1 < len(fix_args):
+                            stress_damping = float(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        elif opt == "max_velocity" and i + 1 < len(fix_args):
+                            max_velocity = float(self.evaluate_expression(fix_args[i + 1]))
+                            i += 2
+                        else:
+                            i += 1
+
+                    fix_inst = FixTriaxial(
+                        domain=self.domain,
+                        float_type=self.default_fp or ti.f64,
+                        target_stress=target_stress,
+                        strain_rate=strain_rate,
+                        stress_mask=stress_mask,
+                        stress_damping=stress_damping,
+                        max_velocity=max_velocity,
+                    )
+                    self.fixes[fix_id] = fix_inst
+                    if self.simulation:
+                        self.simulation.add_fix(fix_inst)
+
                 elif fix_style.startswith("wall/gran") and self.domain:
                     # Parse wall/gran and wall/gran/region
                     # fix <id> <group> wall/gran/region <fstyle> ... region <reg_id>
@@ -599,7 +840,7 @@ class LAMMPSInputParser:
                         fstyle = fix_args[i].lower()
                         i += 1
                         # If numeric args follow: Kn, Kt, gamma_n, gamma_t, xmu, dampflag
-                        num_params = []
+                        num_params: list[float | None] = []
                         while i < len(fix_args) and fix_args[i].lower() not in (
                             "xplane", "yplane", "zplane", "cylinder", "zcylinder", "region"
                         ):
@@ -672,14 +913,14 @@ class LAMMPSInputParser:
                                 c1=reg["c1"],
                                 c2=reg["c2"],
                                 radius=reg["radius"],
-                                side=reg.get("side", "in"),
+                                side="out" if str(reg.get("side", "in")).lower() == "out" else "in",
                                 axis_lo=reg.get("lo"),
                                 axis_hi=reg.get("hi"),
                                 fstyle=fstyle,
                                 kn=kn,
                                 gamman=gamman,
-                                kt=kt,
-                                gammat=gammat,
+                                kt=kt if kt is not None else 0.0,
+                                gammat=gammat if gammat is not None else 0.0,
                                 xmu=xmu,
                                 dampflag=dampflag,
                             )
@@ -697,18 +938,19 @@ class LAMMPSInputParser:
                                 xmu=xmu,
                             )
                     elif wallstyle == "cylinder":
+                        side_str: Literal["in", "out"] = "out" if side_val == "out" or side_val == 1 else "in"
                         fix_inst = FixWallGranRegion(
                             domain=self.domain,
                             axis=axis_str,
                             c1=c1,
                             c2=c2,
                             radius=radius,
-                            side=side_val,
+                            side=side_str,
                             fstyle=fstyle,
                             kn=kn,
                             gamman=gamman,
-                            kt=kt,
-                            gammat=gammat,
+                            kt=kt if kt is not None else 0.0,
+                            gammat=gammat if gammat is not None else 0.0,
                             xmu=xmu,
                             dampflag=dampflag,
                         )
@@ -763,13 +1005,16 @@ class LAMMPSInputParser:
                     # Update pair if changed
                     if self.pair_style and self.simulation.pair_style != self.pair_style:
                         self.simulation.pair_style = self.pair_style
+                    for f in self.fixes.values():
+                        if f not in self.simulation.fixes:
+                            self.simulation.add_fix(f)
                     self.simulation.run(nsteps)
 
 
 LammpsInputParser = LAMMPSInputParser
 
 
-def parse_and_run(script_path: str | Path) -> Simulation:
+def parse_and_run(script_path: str | Path) -> Simulation | None:
     """Parse and run a LAMMPS script."""
     parser = LAMMPSInputParser(script_path)
     parser.execute()

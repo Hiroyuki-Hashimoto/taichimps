@@ -50,7 +50,7 @@ def main() -> None:
 
     try:
         ti.init(arch=selected_arch, default_fp=default_fp)
-    except Exception as e:
+    except RuntimeError as e:
         print(f"[taichimps WARNING] Failed to initialize backend {args.arch} ({e}), falling back to CPU...")
         selected_arch = ti.cpu
         ti.init(arch=ti.cpu, default_fp=default_fp)

@@ -101,6 +101,80 @@ class Simulation:
         for fix in self.fixes:
             fix.post_force(self.atom, self.dt)
 
+    def _sub_step_inner(self) -> None:
+        """Execute a single time step without CPU synchronizations or periodic I/O."""
+        # 1. Initial integration (Velocity Verlet 1st half)
+        if self.integrator is not None:
+            self.integrator.initial_integrate(self.atom, self.dt)
+
+        # 2. Neighbor list build check
+        if self.neighbor is not None:
+            rebuilt = self.neighbor.check_and_build(self.atom, self.timestep)
+            if rebuilt and self.history is not None:
+                self.history.compress_and_update(self.neighbor)
+
+        # 3. Clear forces & torques
+        self.atom.clear_forces()
+
+        # 4. Pair force computation (Granular contact)
+        if self.pair_style is not None and self.neighbor is not None:
+            self.pair_style.compute(
+                self.atom,
+                self.neighbor,
+                self.history,
+                self.dt,
+            )
+
+        # 5. Fix post_force (e.g. Gravity, Walls)
+        for fix in self.fixes:
+            fix.post_force(self.atom, self.dt)
+
+        # 6. Final integration (Velocity Verlet 2nd half)
+        if self.integrator is not None:
+            self.integrator.final_integrate(self.atom, self.dt)
+
+        # 7. Fix end_of_step (e.g. deform/pressure, print)
+        for fix in self.fixes:
+            fix.end_of_step(self.atom, self.dt)
+
+        self.timestep += 1
+
+    def run_gpu(self, steps: int) -> None:
+        """
+        Execute simulation steps in pure batch on GPU/device, minimizing CPU sync.
+
+        If dumps or periodic I/O fixes exist, runs in sub-batches up to the next I/O interval.
+        """
+        if self.timestep == 0:
+            self.init_simulation()
+
+        intervals = []
+        for _, freq in self.dumps:
+            if freq > 0:
+                intervals.append(freq)
+        for fix in self.fixes:
+            if hasattr(fix, "nevery") and fix.nevery > 0:
+                intervals.append(fix.nevery)
+
+        remaining = steps
+        while remaining > 0:
+            chunk = remaining
+            for freq in intervals:
+                rem_to_freq = freq - (self.timestep % freq)
+                if rem_to_freq > 0 and rem_to_freq < chunk:
+                    chunk = rem_to_freq
+            chunk = max(1, chunk)
+
+            for _ in range(chunk):
+                self._sub_step_inner()
+
+            # Periodic dump output
+            for dump_writer, freq in self.dumps:
+                if self.timestep % freq == 0:
+                    dump_writer.write_dump(self.timestep, self.domain, self.atom)
+
+            remaining -= chunk
+
     def step(self) -> None:
         """
         Execute a single Velocity Verlet DEM timestep:
@@ -110,41 +184,9 @@ class Simulation:
         4. Compute pair forces (Granular contact)
         5. Fix post_force (Gravity, Wall contact)
         6. Fix final_integrate (v 2nd half-step, omega 2nd half-step)
+        7. Fix end_of_step (e.g. deform/pressure)
         """
-        # Step 1: Initial integration
-        if self.integrator is not None:
-            self.integrator.initial_integrate(self.atom, self.dt)
-
-        # Step 2: Neighbor list build check
-        rebuilt = self.neighbor.check_and_build(self.atom, self.timestep)
-        if rebuilt and self.history is not None:
-            self.history.compress_and_update(self.neighbor)
-
-        # Step 3: Clear forces
-        self.atom.clear_forces()
-
-        # Step 4: Pair force computation
-        if self.pair_style is not None:
-            self.pair_style.compute(
-                self.atom,
-                self.neighbor,
-                self.history,
-                self.dt,
-            )
-
-        # Step 5: Fix post_force (e.g. Gravity, Walls)
-        for fix in self.fixes:
-            fix.post_force(self.atom, self.dt)
-
-        # Step 6: Final integration
-        if self.integrator is not None:
-            self.integrator.final_integrate(self.atom, self.dt)
-
-        # Step 7: Fix end_of_step (e.g. deform/pressure)
-        for fix in self.fixes:
-            fix.end_of_step(self.atom, self.dt)
-
-        self.timestep += 1
+        self._sub_step_inner()
 
         # Periodic dump output
         for dump_writer, freq in self.dumps:

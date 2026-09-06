@@ -7,6 +7,15 @@ from taichimps.computes import Computes
 from taichimps.contact_history import ContactHistory
 from taichimps.domain import Domain
 from taichimps.dump import DumpWriter
+from taichimps.EXTRA_TAICHI import (
+    FixAveProbe,
+    FixProbe,
+    FixSponge,
+    FixTriaxial,
+    FixTriaxServo,
+    FixWave,
+    WinSponge,
+)
 from taichimps.input import LammpsInputParser, parse_and_run
 from taichimps.neighbor import NeighborList
 from taichimps.script_parser import ScriptParser
@@ -21,10 +30,17 @@ __all__ = [
     "ContactHistory",
     "Domain",
     "DumpWriter",
+    "FixAveProbe",
+    "FixProbe",
+    "FixSponge",
+    "FixTriaxServo",
+    "FixTriaxial",
+    "FixWave",
     "LammpsInputParser",
     "NeighborList",
     "ScriptParser",
     "Simulation",
     "Visualizer3D",
+    "WinSponge",
     "parse_and_run",
 ]
