@@ -3,18 +3,20 @@ LAMMPS pair_style gran/hooke/history implementation in Taichi.
 Reference: LAMMPS src/GRANULAR/pair_gran_hooke_history.cpp
 License: GPL v2 / taichimps MIT reimplementation
 
-Formulation:
-Normal force:
-  Fn = - (Kn * delta - damp_n * meff * vn) * n_ij
-Tangential force (incremental history):
-  vtr = vt - (r_i * omega_i + r_j * omega_j) x n_ij
-  vrel = (v_i - v_j) + (r_i * omega_i + r_j * omega_j) x n_ij
-  delta_s += vrel_tangential * dt
-  Ft_trial = - (Kt * delta_s + damp_t * meff * vt)
+Formulation (follows PairGranHookeHistory::compute line for line):
+  damp = meff * gamma_n * vnnr / r^2
+  ccel = Kn * delta / r - damp            (radial force magnitude / r)
+  vtr  = vt - W x n,  W = r_i * omega_i + r_j * omega_j
+  shear += vtr * dt,  then project out the component along n
+  Ft   = -(Kt * shear + meff * gamma_t * vtr)
 Coulomb criterion:
-  if |Ft_trial| > mu * |Fn_elastic|:
-      Ft = Ft_trial * (mu * |Fn_elastic| / |Ft_trial|)
-      delta_s = -Ft / Kt  (rescale shear displacement)
+  Fn_crit = xmu * |ccel * r|
+  if |Ft| > Fn_crit: rescale both Ft and the stored shear by Fn_crit / |Ft|
+
+Note on `dampflag`: in LAMMPS damping is *always* proportional to meff.
+`dampflag = 0` does not switch that off, it zeroes the tangential damping
+coefficient outright (see PairGranHookeHistory::settings), which is why it is
+applied to `gammat` in __init__ rather than branched on in the kernel.
 """
 
 from typing import Any
@@ -38,7 +40,9 @@ class GranHookeHistory(GranularPair):
       kt: Tangential spring stiffness
       gammat: Tangential damping constant
       xmu: Friction coefficient
-      dampflag: 1 if damping is proportional to meff (standard), 0 if absolute
+      dampflag: 0 excludes the tangential damping force (gammat is zeroed), 1 includes it
+      limit_damping: clamp the normal force at zero so damping cannot make the
+        contact attractive. Off by default, matching the LAMMPS keyword.
     """
 
     def __init__(
@@ -50,21 +54,25 @@ class GranHookeHistory(GranularPair):
         gammat: float,
         xmu: float,
         dampflag: int = 1,
+        limit_damping: bool = False,
         float_type: Any = ti.f64,
     ) -> None:
         super().__init__(domain, float_type=float_type)
         self.kn = float(kn)
         self.gamman = float(gamman)
         self.kt = float(kt)
-        self.gammat = float(gammat)
+        self.dampflag = int(dampflag)
+        # LAMMPS: "if (dampflag == 0) gammat = 0.0"
+        self.gammat = 0.0 if self.dampflag == 0 else float(gammat)
         self.xmu = float(xmu)
-        self.dampflag = dampflag
+        self.limit_damping = 1 if limit_damping else 0
 
     @ti.kernel
     def compute_kernel(
         self,
         nlocal: ti.i32,
         dt: ti.template(),
+        shearupdate: ti.i32,
         x: ti.template(),
         v: ti.template(),
         f: ti.template(),
@@ -72,6 +80,8 @@ class GranHookeHistory(GranularPair):
         torque: ti.template(),
         radius: ti.template(),
         rmass: ti.template(),
+        tag: ti.template(),
+        virial: ti.template(),
         num_neighbors: ti.template(),
         neighbors: ti.template(),
         shear_hist: ti.template(),
@@ -121,40 +131,46 @@ class GranHookeHistory(GranularPair):
                     vn_vec = dpos * (vnnr * rsqinv)
                     vt_vec = (vi - vj) - vn_vec
                     wr = (ri * oi + rj * oj) * rinv
-                    vtr = vt_vec - dpos.cross(wr) # dpos x wr matches LAMMPS (delz*wr2-dely*wr3)
+                    # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
+                    # With wr = W/r and dpos = r*n, dpos.cross(wr) = n x W = -(W x n),
+                    # so the rotational term is ADDED here.
+                    vtr = vt_vec + dpos.cross(wr)
 
                     damp = meff * self.gamman * vnnr * rsqinv
-                    if self.dampflag == 0:
-                        damp = self.gamman * vnnr * rsqinv
-
                     ccel = self.kn * delta * rinv - damp
-                    ccel = max(ccel, 0.0)
+                    if self.limit_damping == 1 and ccel < 0.0:
+                        ccel = 0.0
 
                     # Tangential force (incremental shear history)
-                    partner = partner_hist[i, k]
+                    jtag = tag[j]
                     shear = shear_hist[i, k]
-                    if partner != j:
+                    if partner_hist[i, k] != jtag:
                         shear = ti.Vector([0.0, 0.0, 0.0])
-                        partner_hist[i, k] = j
+                        partner_hist[i, k] = jtag
 
-                    shear = shear + vtr * dt
+                    gammat_eff = meff * self.gammat
 
-                    # Rotate shear displacement vector: shear -= (shear . dpos) * rsqinv * dpos
-                    rsht = shear.dot(dpos) * rsqinv
-                    shear = shear - rsht * dpos
+                    # LAMMPS accumulates first, takes |shear|, and only then
+                    # projects the shear back into the tangent plane.
+                    if shearupdate != 0:
+                        shear = shear + vtr * dt
                     shrmag = shear.norm()
+                    if shearupdate != 0:
+                        rsht = shear.dot(dpos) * rsqinv
+                        shear = shear - rsht * dpos
 
-                    # Tangential force components:
-                    gammat_eff = meff * self.gammat if self.dampflag == 1 else self.gammat
                     fs_vec = -(self.kt * shear + gammat_eff * vtr)
                     fs_mag = fs_vec.norm()
 
                     fn_coulomb = self.xmu * ti.abs(ccel * r)
-                    if fs_mag > fn_coulomb and shrmag > 1e-16:
-                        ratio = fn_coulomb / fs_mag
-                        damp_corr = gammat_eff * vtr / self.kt
-                        shear = ratio * (shear + damp_corr) - damp_corr
-                        fs_vec = -(self.kt * shear + gammat_eff * vtr)
+                    if fs_mag > fn_coulomb:
+                        if shrmag != 0.0:
+                            ratio = fn_coulomb / fs_mag
+                            damp_corr = gammat_eff * vtr / self.kt
+                            shear = ratio * (shear + damp_corr) - damp_corr
+                            fs_vec = ratio * fs_vec
+                        else:
+                            fs_vec = ti.Vector([0.0, 0.0, 0.0])
 
                     shear_hist[i, k] = shear
 
@@ -166,6 +182,18 @@ class GranHookeHistory(GranularPair):
                     tor = rinv * dpos.cross(fs_vec)
                     ti.atomic_add(torque[i], -ri * tor)
                     ti.atomic_add(torque[j], -rj * tor)
+
+                    # Pairwise virial, as in Pair::ev_tally_xyz()
+                    vir = 0.5 * ti.Vector([
+                        dpos[0] * f_total[0],
+                        dpos[1] * f_total[1],
+                        dpos[2] * f_total[2],
+                        dpos[0] * f_total[1],
+                        dpos[0] * f_total[2],
+                        dpos[1] * f_total[2],
+                    ])
+                    ti.atomic_add(virial[i], vir)
+                    ti.atomic_add(virial[j], vir)
                 else:
                     # Not in contact: clear history
                     partner_hist[i, k] = -1
@@ -177,12 +205,14 @@ class GranHookeHistory(GranularPair):
         nlist: NeighborList,
         history: ContactHistory,
         dt: float,
+        shearupdate: bool = True,
     ) -> None:
         if atom.nlocal == 0:
             return
         self.compute_kernel(
             atom.nlocal,
             dt,
+            1 if shearupdate else 0,
             atom.x,
             atom.v,
             atom.f,
@@ -190,6 +220,8 @@ class GranHookeHistory(GranularPair):
             atom.torque,
             atom.radius,
             atom.rmass,
+            atom.tag,
+            atom.virial,
             nlist.num_neighbors,
             nlist.neighbors,
             history.shear,

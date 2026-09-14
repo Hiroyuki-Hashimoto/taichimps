@@ -44,6 +44,14 @@ class AtomSystem:
         self.tag = ti.field(dtype=ti.i32, shape=max_atoms)
         self.mask = ti.field(dtype=ti.i32, shape=max_atoms)
 
+        # Per-atom virial [xx, yy, zz, xy, xz, yz], accumulated pairwise by the
+        # force kernels the way LAMMPS does it in Pair::ev_tally_xyz(): each
+        # contact contributes 0.5 * del_a * f_b to both partners, so summing
+        # this field over atoms recovers the global virial.  Accumulating per
+        # pair (rather than as sum(x_i . f_i)) is what makes the virial
+        # translation invariant under periodic boundaries.
+        self.virial = ti.Vector.field(6, dtype=float_type, shape=max_atoms)
+
     def add_particles(
         self,
         x: Any,
@@ -192,7 +200,8 @@ class AtomSystem:
 
     @ti.kernel
     def clear_forces(self):
-        """Zero out forces and torques at start of timestep."""
+        """Zero out forces, torques and virial at start of timestep."""
         for i in range(self.nlocal):
             self.f[i] = ti.Vector([0.0, 0.0, 0.0])
             self.torque[i] = ti.Vector([0.0, 0.0, 0.0])
+            self.virial[i] = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])

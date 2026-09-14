@@ -36,17 +36,21 @@ def test_hooke_normal_contact():
     # kn = 1000.0, gamman = 10.0, kt = 0.0, gammat = 0.0, xmu = 0.0, dampflag = 0
     pair = GranHooke(domain=domain, kn=1000.0, gamman=10.0, kt=0.0, gammat=0.0, xmu=0.0, dampflag=0)
 
-    # delta = 2.0 - 1.9 = 0.1
-    # v_rel_n = (v0 - v1).n = (0.1 - (-0.1)) = 0.2 (approach velocity, distance decreasing)
-    # fn = kn * delta - gamman * vn
-    # Here vn = (vi - vj).n = -0.2 (negative because particles are approaching)
-    # fn = 1000.0 * 0.1 - 10.0 * (-0.2) = 100.0 + 2.0 = 102.0
-    # force on 0: f0 = fn * n = 102.0 * (-1, 0, 0) = (-102.0, 0, 0)
-    # force on 1: f1 = -fn * n = (+102.0, 0, 0)
+    # Normal damping in LAMMPS is always scaled by the effective mass; dampflag
+    # only controls the *tangential* damping term.  So with
+    #   m     = 4/3 pi r^3 rho          = 4188.7902...
+    #   meff  = m * m / (m + m) = m / 2 = 2094.3951...
+    #   dpos  = x0 - x1 = (-1.9, 0, 0),  vnnr = (v0 - v1) . dpos = -0.38
+    #   damp  = meff * gamman * vnnr / rsq          = -2204.6212...
+    #   ccel  = kn * delta / r - damp               =  2257.2528...
+    #   f0    = dpos * ccel                         = (-4288.7902..., 0, 0)
+    # Cross-checked against the LAMMPS binary (pair_style gran/hooke,
+    # run 0) which reports fx = -4288.79020479 for particle 1.
+    expected = 4288.790204786391
 
     pair.compute(atom, nlist, history, dt=0.001)
 
     f = atom.f.to_numpy()
-    np.testing.assert_allclose(f[0], [-102.0, 0.0, 0.0], rtol=1e-5)
-    np.testing.assert_allclose(f[1], [102.0, 0.0, 0.0], rtol=1e-5)
+    np.testing.assert_allclose(f[0], [-expected, 0.0, 0.0], rtol=1e-12)
+    np.testing.assert_allclose(f[1], [expected, 0.0, 0.0], rtol=1e-12)
 

@@ -120,9 +120,15 @@ class LAMMPSInputParser:
             self.variables["pyz"] = float(p_tensor[5])
             p_mean = (p_tensor[0] + p_tensor[1] + p_tensor[2]) / 3.0
             self.variables["p"] = float(p_mean)
-            self.variables["pxx_p"] = float(p_tensor[0])
-            self.variables["pyy_p"] = float(p_tensor[1])
-            self.variables["pzz_p"] = float(p_tensor[2])
+            # The *_p variables stand for the pair-only pressure, i.e. what
+            # `compute <id> all pressure NULL pair` reports: passing NULL for
+            # the temperature compute drops the kinetic term entirely.
+            p_pair = self.simulation.computes.compute_pressure_tensor(
+                self.atom, self.domain, kinetic=False
+            )
+            self.variables["pxx_p"] = float(p_pair[0])
+            self.variables["pyy_p"] = float(p_pair[1])
+            self.variables["pzz_p"] = float(p_pair[2])
 
             # Energy
             ke_t = self.simulation.computes.ke_trans(self.atom)
@@ -147,6 +153,36 @@ class LAMMPSInputParser:
                 vs = float(self.variables["Vs"])
                 if vs > 0.0:
                     self.variables["e"] = (self.domain.volume - vs) / vs
+
+    def _parse_gran_settings(
+        self, args: list[str]
+    ) -> tuple[float, float, float, float, float, int, bool]:
+        """
+        Parse `Kn Kt gamma_n gamma_t xmu dampflag [limit_damping]`.
+
+        Mirrors PairGranHookeHistory::settings(), including the NULL shorthands:
+        a NULL tangential stiffness means Kn * 2/7 and a NULL tangential damping
+        means gamma_n / 2 (these are not zero, which is what this used to read).
+        """
+        if len(args) < 6:
+            raise ValueError(
+                "pair_style gran/* needs Kn Kt gamma_n gamma_t xmu dampflag"
+            )
+
+        kn = float(self.evaluate_expression(args[0]))
+        kt = kn * 2.0 / 7.0 if args[1] == "NULL" else float(self.evaluate_expression(args[1]))
+        gamman = float(self.evaluate_expression(args[2]))
+        gammat = 0.5 * gamman if args[3] == "NULL" else float(self.evaluate_expression(args[3]))
+        xmu = float(self.evaluate_expression(args[4]))
+        dampflag = int(float(self.evaluate_expression(args[5])))
+
+        limit_damping = False
+        if len(args) > 6:
+            if args[6] != "limit_damping":
+                raise ValueError(f"Unknown pair_style gran/* keyword: {args[6]}")
+            limit_damping = True
+
+        return kn, kt, gamman, gammat, xmu, dampflag, limit_damping
 
     def evaluate_expression(self, expr_str: str) -> float | str:
         """Evaluate a mathematical expression or resolve variables."""
@@ -420,50 +456,28 @@ class LAMMPSInputParser:
                 style_name = args[0]
                 if self.domain is None:
                     continue
-                if "gran/hertz/history" in style_name:
-                    kn = float(self.evaluate_expression(args[1]))
-                    kt = float(self.evaluate_expression(args[2]))
-                    gamman = float(self.evaluate_expression(args[3])) if args[3] != "NULL" else 0.0
-                    gammat = float(self.evaluate_expression(args[4])) if args[4] != "NULL" else 0.0
-                    xmu = float(self.evaluate_expression(args[5]))
-                    dampflag = int(args[6]) if len(args) > 6 else 0
-                    self.pair_style = GranHertzHistory(
-                        domain=self.domain,
-                        kn=kn,
-                        kt=kt,
-                        gamman=gamman,
-                        gammat=gammat,
-                        xmu=xmu,
-                        dampflag=dampflag,
+                if style_name in ("gran/hertz/history", "gran/hooke/history", "gran/hooke"):
+                    kn, kt, gamman, gammat, xmu, dampflag, limit_damping = (
+                        self._parse_gran_settings(args[1:])
                     )
-                elif "gran/hooke/history" in style_name:
-                    kn = float(self.evaluate_expression(args[1]))
-                    kt = float(self.evaluate_expression(args[2]))
-                    gamman = float(self.evaluate_expression(args[3])) if args[3] != "NULL" else 0.0
-                    gammat = float(self.evaluate_expression(args[4])) if args[4] != "NULL" else 0.0
-                    xmu = float(self.evaluate_expression(args[5]))
-                    self.pair_style = GranHookeHistory(
-                        domain=self.domain,
-                        kn=kn,
-                        kt=kt,
-                        gamman=gamman,
-                        gammat=gammat,
-                        xmu=xmu,
-                    )
-                elif "gran/hooke" in style_name:
-                    kn = float(self.evaluate_expression(args[1]))
-                    kt = float(self.evaluate_expression(args[2]))
-                    gamman = float(self.evaluate_expression(args[3])) if args[3] != "NULL" else 0.0
-                    gammat = float(self.evaluate_expression(args[4])) if args[4] != "NULL" else 0.0
-                    xmu = float(self.evaluate_expression(args[5]))
-                    self.pair_style = GranHooke(
-                        domain=self.domain,
-                        kn=kn,
-                        kt=kt,
-                        gamman=gamman,
-                        gammat=gammat,
-                        xmu=xmu,
-                    )
+                    if style_name == "gran/hertz/history":
+                        self.pair_style = GranHertzHistory(
+                            domain=self.domain, kn=kn, kt=kt, gamman=gamman,
+                            gammat=gammat, xmu=xmu, dampflag=dampflag,
+                            limit_damping=limit_damping,
+                        )
+                    elif style_name == "gran/hooke/history":
+                        self.pair_style = GranHookeHistory(
+                            domain=self.domain, kn=kn, kt=kt, gamman=gamman,
+                            gammat=gammat, xmu=xmu, dampflag=dampflag,
+                            limit_damping=limit_damping,
+                        )
+                    else:
+                        self.pair_style = GranHooke(
+                            domain=self.domain, kn=kn, kt=kt, gamman=gamman,
+                            gammat=gammat, xmu=xmu, dampflag=dampflag,
+                            limit_damping=limit_damping,
+                        )
 
             elif cmd == "fix":
                 fix_id = args[0]

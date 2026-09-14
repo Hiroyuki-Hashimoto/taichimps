@@ -66,6 +66,8 @@ class GranularModular(GranularPair):
         torque: ti.template(),
         radius: ti.template(),
         rmass: ti.template(),
+        tag: ti.template(),
+        virial: ti.template(),
         num_neighbors: ti.template(),
         neighbors: ti.template(),
         shear_hist: ti.template(),
@@ -105,6 +107,9 @@ class GranularModular(GranularPair):
                     if is_hertz == 1:
                         poly = ti.sqrt(reff * delta)
 
+                    # vt - W x n, matching GranularModel::calculate_forces().
+                    # Subtracting before projecting out the normal is
+                    # equivalent because (W x n) is perpendicular to n.
                     w_cross_n = (ri * oi + rj * oj).cross(n)
                     vr = (vi - vj) - w_cross_n
                     vn = vr.dot(n)
@@ -128,11 +133,11 @@ class GranularModular(GranularPair):
                     ft_vec = ti.Vector([0.0, 0.0, 0.0])
 
                     if use_history == 1:
-                        partner = partner_hist[i, k]
+                        jtag = tag[j]
                         shear = shear_hist[i, k]
-                        if partner != j:
+                        if partner_hist[i, k] != jtag:
                             shear = ti.Vector([0.0, 0.0, 0.0])
-                            partner_hist[i, k] = j
+                            partner_hist[i, k] = jtag
 
                         shear_dot_n = shear.dot(n)
                         shear = shear - shear_dot_n * n
@@ -162,6 +167,18 @@ class GranularModular(GranularPair):
                     n_cross_ft = n.cross(ft_vec)
                     ti.atomic_add(torque[i], -ri * n_cross_ft)
                     ti.atomic_add(torque[j], -rj * n_cross_ft)
+
+                    # Pairwise virial, as in Pair::ev_tally_xyz()
+                    vir = 0.5 * ti.Vector([
+                        dpos[0] * f_total[0],
+                        dpos[1] * f_total[1],
+                        dpos[2] * f_total[2],
+                        dpos[0] * f_total[1],
+                        dpos[0] * f_total[2],
+                        dpos[1] * f_total[2],
+                    ])
+                    ti.atomic_add(virial[i], vir)
+                    ti.atomic_add(virial[j], vir)
                 else:
                     if use_history == 1:
                         partner_hist[i, k] = -1
@@ -173,6 +190,7 @@ class GranularModular(GranularPair):
         nlist: NeighborList,
         history: ContactHistory,
         dt: float,
+        shearupdate: bool = True,
     ) -> None:
         if atom.nlocal == 0:
             return
@@ -188,6 +206,8 @@ class GranularModular(GranularPair):
             atom.torque,
             atom.radius,
             atom.rmass,
+            atom.tag,
+            atom.virial,
             nlist.num_neighbors,
             nlist.neighbors,
             history.shear,

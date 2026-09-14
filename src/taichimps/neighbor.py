@@ -38,11 +38,19 @@ class NeighborList:
             self.max_neighbors_per_atom = max_neighbors_per_atom
         self.float_type = float_type
 
-        # Neighbor list arrays
+        # Neighbor list arrays.  Size from self.max_neighbors_per_atom, which
+        # accounts for the `max_neighbors` alias; using the raw argument here
+        # would under-allocate whenever the alias asked for a larger list and
+        # the build kernel would write past the end of the field.
         self.num_neighbors = ti.field(dtype=ti.i32, shape=max_atoms)
         self.neighbors = ti.field(
-            dtype=ti.i32, shape=(max_atoms, max_neighbors_per_atom)
+            dtype=ti.i32, shape=(max_atoms, self.max_neighbors_per_atom)
         )
+        # Set when a candidate pair could not be stored because the per-atom
+        # list was full.  LAMMPS grows its pages instead; we cannot resize a
+        # Taichi field mid-run, so this is reported as an error rather than
+        # silently dropping contacts.
+        self.overflow = ti.field(dtype=ti.i32, shape=())
 
         # Displacement check for skin / neigh_modify
         self.x0 = ti.Vector.field(3, dtype=float_type, shape=max_atoms)
@@ -81,6 +89,18 @@ class NeighborList:
         gx = max(1, int(np.floor(prd[0] / cut)))
         gy = max(1, int(np.floor(prd[1] / cut)))
         gz = max(1, int(np.floor(prd[2] / cut)))
+
+        # A periodic dimension binned into exactly 2 cells is degenerate: the
+        # -1 and +1 stencil offsets wrap onto the same cell, so every candidate
+        # in it would be visited twice and end up in the list twice (doubling
+        # the contact force).  Collapse such a dimension to a single bin, which
+        # the stencil then visits exactly once.
+        if self.domain.periodicity[0] == 1 and gx == 2:
+            gx = 1
+        if self.domain.periodicity[1] == 1 and gy == 2:
+            gy = 1
+        if self.domain.periodicity[2] == 1 and gz == 2:
+            gz = 1
 
         total_cells = gx * gy * gz
         if total_cells > self.max_grid_cells:
@@ -173,6 +193,15 @@ class NeighborList:
                 ny = cy + dy
                 nz = cz + dz
 
+                # A periodic dimension with a single bin is already fully
+                # covered by the dx == 0 offset; wrapping the others onto it
+                # would visit the same cell three times.
+                skip = (
+                    (px == 1 and gx == 1 and dx != 0)
+                    or (py == 1 and gy == 1 and dy != 0)
+                    or (pz == 1 and gz == 1 and dz != 0)
+                )
+
                 # Handle boundary wrapping
                 if px == 1:
                     nx = (nx % gx + gx) % gx
@@ -181,17 +210,23 @@ class NeighborList:
                 if pz == 1:
                     nz = (nz % gz + gz) % gz
 
-                if 0 <= nx < gx and 0 <= ny < gy and 0 <= nz < gz:
+                if not skip and 0 <= nx < gx and 0 <= ny < gy and 0 <= nz < gz:
                     c_idx = nx + ny * gx + nz * gxy
                     j = self.grid_head[c_idx]
-                    while j != -1 and count < self.max_neighbors_per_atom:
+                    while j != -1:
                         if j > i:
                             dpos = self.domain.minimum_image(pos_i - x[j])
                             rsq = dpos.dot(dpos)
                             rad_sum = r_i + radius[j] + self.skin
                             if rsq < rad_sum * rad_sum:
-                                self.neighbors[i, count] = j
-                                count += 1
+                                # Keep scanning even once full, so that the
+                                # overflow is detected rather than hidden by
+                                # an early exit from the bin traversal.
+                                if count < self.max_neighbors_per_atom:
+                                    self.neighbors[i, count] = j
+                                    count += 1
+                                else:
+                                    self.overflow[None] = 1
                         j = self.grid_next[j]
 
             self.num_neighbors[i] = count
@@ -247,7 +282,14 @@ class NeighborList:
         max_r = float(np.max(r_np)) if len(r_np) > 0 else 1.0
         self.setup_grid(2.0 * max_r)
         self.build_grid(atom.nlocal, atom.x)
+        self.overflow[None] = 0
         self.build_neighbor_list(atom.nlocal, atom.x, atom.radius)
+        if self.overflow[None] != 0:
+            raise RuntimeError(
+                "Neighbor list overflow: more than "
+                f"{self.max_neighbors_per_atom} neighbors for at least one particle. "
+                "Increase max_neighbors_per_atom, or reduce the neighbor skin."
+            )
         self.store_x0(atom.nlocal, atom.x)
         self.has_built = True
         self.build_count += 1

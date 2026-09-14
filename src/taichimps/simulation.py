@@ -94,17 +94,45 @@ class Simulation:
         elif self.integrator is fix:
             self.integrator = None
 
+    def reneighbor_if_needed(self) -> bool:
+        """
+        Apply PBC, rebuild the neighbor list and carry contact history over,
+        but only on steps where LAMMPS would reneighbor.
+
+        Mirrors the LAMMPS ordering: FixNeighHistory::pre_exchange() saves the
+        touching contacts, Domain::pbc() remaps coordinates into the box, the
+        list is rebuilt, then FixNeighHistory::post_neighbor() restores history
+        onto the new list.  Wrapping coordinates only here (rather than every
+        step) is also what keeps the skin displacement check meaningful, since
+        x0 and x then live in the same periodic image.
+        """
+        if self.neighbor is None:
+            return False
+        if not self.neighbor.decide(self.atom, self.timestep):
+            return False
+
+        if self.history is not None:
+            self.history.save_state(self.atom)
+        self.domain.pbc(self.atom)
+        self.neighbor.build(self.atom)
+        if self.history is not None:
+            self.history.restore_state(self.atom, self.neighbor)
+        return True
+
     def init_simulation(self) -> None:
         """Initialize forces for the first timestep if not already done."""
         # Calculate initial forces if needed
         self.atom.clear_forces()
         if self.pair_style is not None:
-            self.neighbor.check_and_build(self.atom, self.timestep)
+            self.reneighbor_if_needed()
+            # LAMMPS sets shearupdate = 0 while update->setupflag is on, so the
+            # setup force evaluation must not advance the shear history.
             self.pair_style.compute(
                 self.atom,
                 self.neighbor,
                 self.history,
                 self.dt,
+                shearupdate=False,
             )
         for fix in self.fixes:
             fix.post_force(self.atom, self.dt)
@@ -115,11 +143,8 @@ class Simulation:
         if self.integrator is not None:
             self.integrator.initial_integrate(self.atom, self.dt)
 
-        # 2. Neighbor list build check
-        if self.neighbor is not None:
-            rebuilt = self.neighbor.check_and_build(self.atom, self.timestep)
-            if rebuilt and self.history is not None:
-                self.history.compress_and_update(self.neighbor)
+        # 2. PBC + neighbor list rebuild (carries contact history over)
+        self.reneighbor_if_needed()
 
         # 3. Clear forces & torques
         self.atom.clear_forces()

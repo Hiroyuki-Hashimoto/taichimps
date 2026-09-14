@@ -45,32 +45,37 @@ class Computes:
     def compute_virial_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        f: ti.template(),
         v: ti.template(),
         rmass: ti.template(),
+        atom_virial: ti.template(),
+        keflag: ti.i32,
     ):
-        for k in range(6):
+        """
+        Sum the pairwise virial tallied by the force kernels, plus optionally
+        the kinetic term, into the 6-component tensor [xx, yy, zz, xy, xz, yz].
+
+        The virial itself is accumulated per contact (0.5 * del_a * f_b into
+        each partner) in the pair styles, exactly as LAMMPS does in
+        Pair::ev_tally_xyz(). Summing sum(x_i . f_i) instead -- as this used to
+        -- is not translation invariant under periodic boundaries, because
+        taichimps has no ghost atoms to unwrap against.
+        """
+        for k in ti.static(range(6)):
             self.virial_tensor[k] = 0.0
 
         for i in range(nlocal):
-            # Kinetic part: m * v_a * v_b
-            mvx2 = rmass[i] * v[i][0] * v[i][0]
-            mvy2 = rmass[i] * v[i][1] * v[i][1]
-            mvz2 = rmass[i] * v[i][2] * v[i][2]
-            mvxy = rmass[i] * v[i][0] * v[i][1]
-            mvxz = rmass[i] * v[i][0] * v[i][2]
-            mvyz = rmass[i] * v[i][1] * v[i][2]
+            vir = atom_virial[i]
+            for k in ti.static(range(6)):
+                self.virial_tensor[k] += vir[k]
 
-            # Virial part from total forces: x_a * f_b
-            # Note: For pair interactions, sum x_i * f_i equals -0.5 sum r_ij * f_ij
-            # In LAMMPS Virial convention: P_ab = (sum m v_a v_b + sum r_ab * f_ab) / V
-            self.virial_tensor[0] += mvx2 + x[i][0] * f[i][0]
-            self.virial_tensor[1] += mvy2 + x[i][1] * f[i][1]
-            self.virial_tensor[2] += mvz2 + x[i][2] * f[i][2]
-            self.virial_tensor[3] += mvxy + x[i][0] * f[i][1]
-            self.virial_tensor[4] += mvxz + x[i][0] * f[i][2]
-            self.virial_tensor[5] += mvyz + x[i][1] * f[i][2]
+            if keflag != 0:
+                m = rmass[i]
+                self.virial_tensor[0] += m * v[i][0] * v[i][0]
+                self.virial_tensor[1] += m * v[i][1] * v[i][1]
+                self.virial_tensor[2] += m * v[i][2] * v[i][2]
+                self.virial_tensor[3] += m * v[i][0] * v[i][1]
+                self.virial_tensor[4] += m * v[i][0] * v[i][2]
+                self.virial_tensor[5] += m * v[i][1] * v[i][2]
 
     def ke_trans(self, atom: AtomSystem) -> float:
         """Total translational kinetic energy."""
@@ -111,22 +116,32 @@ class Computes:
         )
         return float(self.ke_trans_val[None] + self.ke_rot_val[None])
 
-    def compute_pressure_tensor(self, atom: AtomSystem, domain: Domain) -> np.ndarray:
-        """Compute the 6 pressure tensor components: [Pxx, Pyy, Pzz, Pxy, Pxz, Pyz]."""
+    def compute_pressure_tensor(
+        self,
+        atom: AtomSystem,
+        domain: Domain,
+        kinetic: bool = True,
+    ) -> np.ndarray:
+        """
+        The 6 pressure tensor components [Pxx, Pyy, Pzz, Pxy, Pxz, Pyz].
+
+        `kinetic=False` corresponds to the LAMMPS `compute pressure NULL pair`
+        form, where no temperature compute is given and only the pair virial
+        contributes. Compression gives a positive pressure, as in LAMMPS.
+        """
         if atom.nlocal == 0:
             return np.zeros(6, dtype=np.float64)
-        self.compute_virial_kernel(
-            atom.nlocal,
-            atom.x,
-            atom.f,
-            atom.v,
-            atom.rmass,
-        )
         vol = domain.volume
         if vol <= 0.0:
             return np.zeros(6, dtype=np.float64)
-        vir = self.virial_tensor.to_numpy()
-        return vir / vol
+        self.compute_virial_kernel(
+            atom.nlocal,
+            atom.v,
+            atom.rmass,
+            atom.virial,
+            1 if kinetic else 0,
+        )
+        return self.virial_tensor.to_numpy() / vol
 
     def compute_coordination_number(self, atom: AtomSystem, neighbor: Any) -> np.ndarray:
         """Compute coordination number (number of neighbors) per particle."""

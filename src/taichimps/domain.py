@@ -73,24 +73,25 @@ class Domain:
 
     @ti.func
     def minimum_image(self, dx):
-        """Apply minimum image convention for periodic boundaries."""
+        """
+        Apply minimum image convention for periodic boundaries.
+
+        Closed form rather than a `while` loop: the loop form spins forever if a
+        coordinate ever becomes non-finite, turning a diverging simulation into
+        a hang instead of a visible NaN.
+        """
         for dim in ti.static(range(3)):
             if self.periodicity[dim] == 1:
-                while dx[dim] > 0.5 * self.prd[dim]:
-                    dx[dim] -= self.prd[dim]
-                while dx[dim] < -0.5 * self.prd[dim]:
-                    dx[dim] += self.prd[dim]
+                dx[dim] -= self.prd[dim] * ti.round(dx[dim] / self.prd[dim])
         return dx
 
     @ti.func
     def pbc_wrap(self, x):
-        """Wrap coordinates inside periodic boundaries."""
+        """Wrap coordinates into [boxlo, boxhi), as LAMMPS Domain::pbc() does."""
         for dim in ti.static(range(3)):
             if self.periodicity[dim] == 1:
-                while x[dim] >= self.boxhi[dim]:
-                    x[dim] -= self.prd[dim]
-                while x[dim] < self.boxlo[dim]:
-                    x[dim] += self.prd[dim]
+                s = (x[dim] - self.boxlo[dim]) / self.prd[dim]
+                x[dim] = self.boxlo[dim] + (s - ti.floor(s)) * self.prd[dim]
         return x
 
     @ti.kernel

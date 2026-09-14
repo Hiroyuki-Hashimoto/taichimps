@@ -12,7 +12,7 @@ Step 1 (initial_integrate):
   v += dtf * (f / m)
   x += dtv * v
   omega += dtf * (torque / I)
-  apply periodic boundary conditions to x
+  (PBC wrapping happens at reneighbor time, not here)
 
 Step 2 (force evaluation occurs in pair / gravity / wall)
 
@@ -66,10 +66,11 @@ class FixNVESphere(Fix):
             v[i] += dtf * (f[i] / m)
 
             # Update position full-step: x(t + dt) = x(t) + dtv * v(t + dt/2)
-            pos = x[i] + dtv * v[i]
-
-            # Periodic boundary wrap
-            x[i] = self.domain.pbc_wrap(pos)
+            # No PBC wrap here: LAMMPS remaps coordinates in Domain::pbc(),
+            # which only runs on reneighboring steps.  Wrapping every step
+            # would make the neighbor list's skin displacement check compare
+            # positions from different periodic images.
+            x[i] = x[i] + dtv * v[i]
 
             # Update angular velocity half-step: omega(t + dt/2) = omega(t) + dtf * (torque / I)
             omega[i] += dtf * (torque[i] / inertia)

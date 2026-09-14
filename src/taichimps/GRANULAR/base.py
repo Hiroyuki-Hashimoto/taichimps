@@ -28,5 +28,11 @@ class GranularPair(ABC):
         nlist: NeighborList,
         history: ContactHistory,
         dt: float,
+        shearupdate: bool = True,
     ) -> None:
-        """Compute contact forces and torques and update history."""
+        """
+        Compute contact forces, torques and the pairwise virial, and update history.
+
+        `shearupdate` mirrors the LAMMPS flag of the same name: it is False for
+        the setup force evaluation, where the shear history must not advance.
+        """

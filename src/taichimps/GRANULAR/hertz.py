@@ -30,15 +30,18 @@ class GranHertz(GranularPair):
         gammat: float,
         xmu: float,
         dampflag: int = 1,
+        limit_damping: bool = False,
         float_type: Any = ti.f64,
     ) -> None:
         super().__init__(domain, float_type=float_type)
         self.kn = float(kn)
         self.gamman = float(gamman)
         self.kt = float(kt)
-        self.gammat = float(gammat)
+        self.dampflag = int(dampflag)
+        # LAMMPS zeroes gammat when dampflag == 0; damping is always meff-scaled.
+        self.gammat = 0.0 if self.dampflag == 0 else float(gammat)
         self.xmu = float(xmu)
-        self.dampflag = dampflag
+        self.limit_damping = 1 if limit_damping else 0
 
     @ti.kernel
     def compute_kernel(
@@ -51,6 +54,7 @@ class GranHertz(GranularPair):
         torque: ti.template(),
         radius: ti.template(),
         rmass: ti.template(),
+        virial: ti.template(),
         num_neighbors: ti.template(),
         neighbors: ti.template(),
     ):
@@ -90,20 +94,18 @@ class GranHertz(GranularPair):
                     vn_vec = dpos * (vnnr * rsqinv)
                     vt_vec = (vi - vj) - vn_vec
                     wr = (ri * oi + rj * oj) * rinv
-                    vtr = vt_vec - dpos.cross(wr)
+                    # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
+                    # dpos.cross(wr) = n x W = -(W x n), hence the plus sign.
+                    vtr = vt_vec + dpos.cross(wr)
                     vrel = vtr.norm()
 
                     damp = meff * self.gamman * vnnr * rsqinv
-                    if self.dampflag == 0:
-                        damp = self.gamman * vnnr * rsqinv
-
                     ccel = (self.kn * delta * rinv - damp) * polyhertz
-                    ccel = max(ccel, 0.0)
+                    if self.limit_damping == 1 and ccel < 0.0:
+                        ccel = 0.0
 
                     fn_coulomb = self.xmu * ti.abs(ccel * r)
                     fs_damp = meff * self.gammat * vrel
-                    if self.dampflag == 0:
-                        fs_damp = self.gammat * vrel
 
                     ft = 0.0
                     if vrel > 1e-16:
@@ -119,12 +121,25 @@ class GranHertz(GranularPair):
                     ti.atomic_add(torque[i], -ri * tor)
                     ti.atomic_add(torque[j], -rj * tor)
 
+                    # Pairwise virial, as in Pair::ev_tally_xyz()
+                    vir = 0.5 * ti.Vector([
+                        dpos[0] * f_total[0],
+                        dpos[1] * f_total[1],
+                        dpos[2] * f_total[2],
+                        dpos[0] * f_total[1],
+                        dpos[0] * f_total[2],
+                        dpos[1] * f_total[2],
+                    ])
+                    ti.atomic_add(virial[i], vir)
+                    ti.atomic_add(virial[j], vir)
+
     def compute(
         self,
         atom: AtomSystem,
         nlist: NeighborList,
         history: ContactHistory,
         dt: float,
+        shearupdate: bool = True,
     ) -> None:
         if atom.nlocal == 0:
             return
@@ -137,6 +152,7 @@ class GranHertz(GranularPair):
             atom.torque,
             atom.radius,
             atom.rmass,
+            atom.virial,
             nlist.num_neighbors,
             nlist.neighbors,
         )
