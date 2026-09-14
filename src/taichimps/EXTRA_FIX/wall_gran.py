@@ -1,12 +1,29 @@
 """
-LAMMPS fix wall/gran implementation in Taichi.
+Frictional contact with a flat, axis-aligned wall.
+
 Reference: LAMMPS src/GRANULAR/fix_wall_gran.cpp
 License: GPL v2 / taichimps MIT reimplementation
 
-Supports flat planar boundaries in x, y, or z (lo or hi).
-Applies normal and tangential Hookean contact force between particle and planar wall.
+LAMMPS treats the wall as a contact partner with zero radius and infinite mass,
+which fixes the geometry of the interaction:
+
+    radsum = radi,  Reff = radi,  meff = rmass[i],  vj = vwall,  omegaj = 0
+
+and the moment arm is the full particle radius (GranularModel scales torquesi by
+radi for contact_type == WALL, not by radi - delta/2 as it does for a pair).
+
+`fix wall/gran hooke/history Kn Kt gamma_n gamma_t xmu dampflag` expands to a
+hooke normal model, mass_velocity damping and the linear_history_classic
+tangential model (GranularModel::define_classic_model), which is the same
+algebra as pair gran/hooke/history.  That is what is implemented here.
+
+This used to have no shear history at all -- just a viscous tangential dashpot
+with a Coulomb cap, i.e. the history-free `hooke` style -- so a specimen resting
+against walls had no frictional memory at the boundary.  `history=True` (the
+default) now keeps a shear displacement per particle per wall.
 """
 
+import math
 from typing import Any
 
 import taichi as ti
@@ -19,17 +36,30 @@ from taichimps.EXTRA_FIX.base import Fix
 @ti.data_oriented
 class FixWallGran(Fix):
     """
-    Planar granular wall interaction.
-    wall_axis: 0 for x, 1 for y, 2 for z
-    wall_side: -1 for lower wall (plane normal points +axis), +1 for upper wall (plane normal points -axis)
-    wall_coord: coordinate position of plane along wall_axis
+    Granular contact with one axis-aligned plane wall.
+
+    Parameters
+        wall_axis   0, 1 or 2
+        wall_side   -1 for a wall below the particles (normal along +axis),
+                    +1 for a wall above them (normal along -axis)
+        wall_coord  position of the wall plane
+        kn, kt      normal and tangential stiffness
+        gamman, gammat  damping coefficients (always scaled by the particle mass,
+                    as in LAMMPS; dampflag = 0 zeroes gammat rather than
+                    removing the mass scaling)
+        xmu         friction coefficient
+        history     keep tangential shear history (the `hooke/history` style);
+                    False reproduces the history-free `hooke` style
+        shear_axis / shear_vel  in-plane wall velocity (`shear` keyword)
+        wiggle_amplitude / wiggle_period  oscillation of the wall along its
+                    normal (`wiggle` keyword)
     """
 
     def __init__(
         self,
         domain: Domain,
-        wall_axis: int,  # 0, 1, or 2
-        wall_side: int,  # -1 (lower boundary) or +1 (upper boundary)
+        wall_axis: int,
+        wall_side: int,
         wall_coord: float,
         kn: float,
         gamman: float,
@@ -37,27 +67,68 @@ class FixWallGran(Fix):
         gammat: float,
         xmu: float,
         dampflag: int = 1,
+        history: bool = True,
+        limit_damping: bool = False,
+        shear_axis: int = -1,
+        shear_vel: float = 0.0,
+        wiggle_amplitude: float = 0.0,
+        wiggle_period: float = 0.0,
+        max_atoms: int = 100000,
         float_type: Any = ti.f64,
     ) -> None:
         super().__init__(domain, float_type=float_type)
-        self.wall_axis = wall_axis
-        self.wall_side = wall_side
+        if wall_axis not in (0, 1, 2):
+            raise ValueError("wall_axis must be 0, 1 or 2")
+        if wall_side not in (-1, 1):
+            raise ValueError("wall_side must be -1 (low) or +1 (high)")
+        if shear_axis == wall_axis:
+            raise ValueError("shear must act in the plane of the wall, not along its normal")
+        if wiggle_amplitude != 0.0 and shear_vel != 0.0:
+            raise ValueError("cannot wiggle and shear the same wall, as in LAMMPS")
+        if wiggle_amplitude != 0.0 and wiggle_period <= 0.0:
+            raise ValueError("wiggle needs a positive period")
+
+        self.wall_axis = int(wall_axis)
+        self.wall_side = int(wall_side)
         self.wall_coord = float(wall_coord)
         self.kn = float(kn)
         self.gamman = float(gamman)
         self.kt = float(kt)
-        self.gammat = float(gammat)
+        self.dampflag = int(dampflag)
+        # LAMMPS: "if (dampflag == 0) gammat = 0.0"
+        self.gammat = 0.0 if self.dampflag == 0 else float(gammat)
         self.xmu = float(xmu)
-        self.dampflag = dampflag
+        self.limit_damping = 1 if limit_damping else 0
+        self.use_history = 1 if history else 0
+
+        self.shear_axis = int(shear_axis)
+        self.shear_vel = float(shear_vel)
+        self.wiggle_amplitude = float(wiggle_amplitude)
+        self.wiggle_period = float(wiggle_period)
+
+        # Per-particle shear history for this wall. The wall is a single
+        # partner, so one slot per particle is enough (LAMMPS uses a one-sided
+        # FixNeighHistory for the same reason).
+        self.shear = ti.Vector.field(3, dtype=float_type, shape=max_atoms)
+        self.touch = ti.field(dtype=ti.i32, shape=max_atoms)
+
+        self.elapsed = 0.0
+
+    @ti.kernel
+    def reset_history(self, nlocal: ti.i32):
+        for i in range(nlocal):
+            self.shear[i] = ti.Vector([0.0, 0.0, 0.0])
+            self.touch[i] = 0
 
     @ti.kernel
     def post_force_kernel(
         self,
         nlocal: ti.i32,
         dt: ti.template(),
-        wall_axis: ti.i32,
-        wall_side: ti.i32,
-        wall_coord: ti.template(),
+        wall_coord: ti.f64,
+        vwall_n: ti.f64,
+        vwall_s: ti.f64,
+        history_update: ti.i32,
         x: ti.template(),
         v: ti.template(),
         f: ti.template(),
@@ -66,80 +137,108 @@ class FixWallGran(Fix):
         radius: ti.template(),
         rmass: ti.template(),
     ):
-        # Normal pointing into the domain (away from wall):
-        # If wall_side == -1 (lower wall at z_lo), wall is below particles, normal is +axis: [0, 0, 1]
-        # If wall_side == 1 (upper wall at z_hi), wall is above particles, normal is -axis: [0, 0, -1]
-        n_wall = ti.Vector([0.0, 0.0, 0.0])
-        if wall_side == -1:
-            n_wall[wall_axis] = 1.0
-        else:
-            n_wall[wall_axis] = -1.0
+        axis = ti.static(self.wall_axis)
+        side = ti.static(self.wall_side)
+        shear_axis = ti.static(self.shear_axis)
+
+        # Normal pointing from the wall into the domain.
+        n = ti.Vector([0.0, 0.0, 0.0])
+        n[axis] = -1.0 if side == 1 else 1.0
+
+        vwall = ti.Vector([0.0, 0.0, 0.0])
+        vwall[axis] = vwall_n
+        if ti.static(shear_axis >= 0):
+            vwall[shear_axis] = vwall_s
 
         for i in range(nlocal):
-            pos_axis = x[i][wall_axis]
-            r_i = radius[i]
+            ri = radius[i]
+            # Signed distance from the wall plane along the inward normal.
+            dist = (x[i][axis] - wall_coord) if side == -1 else (wall_coord - x[i][axis])
+            delta = ri - dist
 
-            # Signed distance from wall plane to particle center in direction of normal
-            # For lower wall (n = +1): dist = pos - coord. Overlap = r_i - dist
-            # For upper wall (n = -1): dist = coord - pos. Overlap = r_i - dist
-            dist = 0.0
-            if wall_side == -1:
-                dist = pos_axis - wall_coord
+            if delta <= 0.0:
+                if ti.static(self.use_history == 1):
+                    self.touch[i] = 0
+                    self.shear[i] = ti.Vector([0.0, 0.0, 0.0])
+                continue
+
+            # The wall has infinite mass, so the effective mass is the particle's.
+            meff = rmass[i]
+
+            vr = v[i] - vwall
+            vnnr = vr.dot(n)
+            vt = vr - vnnr * n
+            # radj = 0, so W = radi * omega_i
+            wr = ri * omega[i]
+            vtr = vt - wr.cross(n)
+            vrel = vtr.norm()
+
+            # normal hooke + mass_velocity damping
+            damp_prefactor = meff * self.gamman
+            fntot = self.kn * delta - damp_prefactor * vnnr
+            if ti.static(self.limit_damping == 1):
+                fntot = ti.max(fntot, 0.0)
+            fscrit = self.xmu * ti.abs(fntot)
+
+            damp_t = meff * self.gammat
+            fs = ti.Vector([0.0, 0.0, 0.0])
+
+            if ti.static(self.use_history == 1):
+                hist = self.shear[i]
+                if self.touch[i] == 0:
+                    hist = ti.Vector([0.0, 0.0, 0.0])
+                    self.touch[i] = 1
+
+                # linear_history_classic: accumulate, take |history|, then
+                # project back into the tangent plane.
+                if history_update != 0:
+                    hist = hist + vtr * dt
+                shrmag = hist.norm()
+                if history_update != 0:
+                    hist = hist - hist.dot(n) * n
+
+                fdamp = -damp_t * vtr
+                fs = -self.kt * hist + fdamp
+
+                magfs = fs.norm()
+                if magfs > fscrit:
+                    if shrmag != 0.0:
+                        fs = fs * (fscrit / magfs)
+                        hist = -(fs - fdamp) / self.kt
+                    else:
+                        fs = ti.Vector([0.0, 0.0, 0.0])
+                self.shear[i] = hist
             else:
-                dist = wall_coord - pos_axis
+                # linear_nohistory: viscous only, capped at the Coulomb limit
+                ft = 0.0
+                if vrel != 0.0:
+                    ft = ti.min(fscrit, damp_t * vrel) / vrel
+                fs = -ft * vtr
 
-            delta = r_i - dist
-            if delta > 0.0:
-                mi = rmass[i]
-                vi = v[i]
-                oi = omega[i]
-
-                # Relative velocity at wall contact:
-                # Particle contact point: x[i] - r_i * n_wall
-                # Surface velocity of particle at contact: vi - r_i * (oi x n_wall)
-                # Wall is stationary: v_wall = 0
-                vr = vi - r_i * oi.cross(n_wall)
-                vn = vr.dot(n_wall)
-                vrn = vn * n_wall
-                vrt = vr - vrn
-
-                # Normal contact force
-                fn_elastic = self.kn * delta
-                fn_damp = self.gamman * vn
-                if self.dampflag == 1:
-                    fn_damp *= mi
-
-                fn = fn_elastic - fn_damp
-                fn = max(fn, 0.0)
-
-                # Tangential contact force (damping / friction)
-                ft_damp = self.gammat * vrt
-                if self.dampflag == 1:
-                    ft_damp *= mi
-
-                ft_vec = -ft_damp
-                ft_mag = ft_vec.norm()
-                ft_max = self.xmu * fn_elastic
-
-                if ft_mag > ft_max and ft_mag > 1e-16:
-                    ft_vec *= ft_max / ft_mag
-
-                f_total = fn * n_wall + ft_vec
-                f[i] += f_total
-
-                # Torque on particle:
-                # r_c x F_t = (-r_i * n_wall) x ft_vec = -r_i * (n_wall x ft_vec)
-                torque[i] += -r_i * n_wall.cross(ft_vec)
+            f[i] += fntot * n + fs
+            # For a wall the moment arm is the full radius.
+            torque[i] += -ri * n.cross(fs)
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
             return
+
+        # Wall position and velocity for this step, as in FixWallGran::post_force
+        coord = self.wall_coord
+        vwall_n = 0.0
+        if self.wiggle_amplitude != 0.0:
+            omega_w = 2.0 * math.pi / self.wiggle_period
+            arg = omega_w * self.elapsed
+            coord += self.wiggle_amplitude * (1.0 - math.cos(arg))
+            vwall_n = self.wiggle_amplitude * omega_w * math.sin(arg)
+
         self.post_force_kernel(
             atom.nlocal,
             dt,
-            self.wall_axis,
-            self.wall_side,
-            self.wall_coord,
+            coord,
+            vwall_n,
+            self.shear_vel,
+            1 if self.history_update else 0,
             atom.x,
             atom.v,
             atom.f,
@@ -148,3 +247,8 @@ class FixWallGran(Fix):
             atom.radius,
             atom.rmass,
         )
+        self.elapsed += dt
+
+    def setup(self, nsteps_total: int = 0) -> None:
+        """Restart the clock the wall motion is referenced to."""
+        self.elapsed = 0.0

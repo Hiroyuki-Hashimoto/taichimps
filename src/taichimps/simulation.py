@@ -141,8 +141,14 @@ class Simulation:
                 self.dt,
                 shearupdate=False,
             )
+        # Fixes that keep their own contact history (the walls) must not
+        # advance it during setup either.
+        for fix in self.fixes:
+            fix.history_update = False
         for fix in self.fixes:
             fix.post_force(self.atom, self.dt)
+        for fix in self.fixes:
+            fix.history_update = True
 
     def _sub_step_inner(self) -> None:
         """Execute a single time step without CPU synchronizations or periodic I/O."""

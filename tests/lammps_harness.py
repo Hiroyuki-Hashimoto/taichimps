@@ -89,6 +89,7 @@ def build_input(
     boundary: str = "p p p",
     integrate: bool = True,
     extra_fixes: str = "",
+    pre_pair: str = "",
 ) -> str:
     """
     A minimal granular input.
@@ -113,7 +114,7 @@ dimension 3
 comm_modify mode single vel yes
 
 read_data data.in
-
+{pre_pair}
 pair_style {pair_style}
 {coeff_line}
 
@@ -172,6 +173,7 @@ def run_lammps(
     boundary: str = "p p p",
     integrate: bool = True,
     extra_fixes: str = "",
+    pre_pair: str = "",
 ) -> list[dict[str, np.ndarray]]:
     """Run LAMMPS in `workdir` and return the parsed dump frames."""
     exe = lmp_executable()
@@ -182,7 +184,8 @@ def run_lammps(
     write_data_file(workdir / "data.in", x, radius, density, v, omega, boxlo, boxhi)
     (workdir / "in.parity").write_text(
         build_input(
-            pair_style, pair_coeff, steps, dt, skin, boundary, integrate, extra_fixes
+            pair_style, pair_coeff, steps, dt, skin, boundary, integrate,
+            extra_fixes, pre_pair,
         )
     )
 

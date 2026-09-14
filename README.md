@@ -28,22 +28,30 @@ Taichi Lang（Python JIT / GPU Kernel Fusion）を用いた、土質・地盤工
    - `NeighborList`: 空間グリッド分割（Cell linked-list）＋Skin変位監視（差分更新）。
    - `ContactHistory`: せん断・転がり変位履歴スロット管理。
    - `Simulation`: Verlet時間積分・オーケストレーション。
-2. **GRANULAR 接触力学**:
-   - `GranHooke` / `GranHookeHistory`: 線形Hooke法線・接線ばね、粘性減衰、クーロン摩擦、変位履歴。
-   - `GranHertz` / `GranHertzHistory`: Hertz接触理論、減衰補正クーロンスライド。
-   - `GranularModular`: モジュラー型接触モデル。
+2. **GRANULAR 接触力学**（LAMMPS バイナリとの数値照合済み）:
+   - 旧世代 `pair_style gran/*` 相当: `GranHooke` / `GranHookeHistory` / `GranHertz` / `GranHertzHistory`。
+     線形Hooke・Hertz法線ばね、meff比例粘性減衰、クーロン摩擦、接線変位履歴。`limit_damping` 対応。
+   - 新世代 `pair_style granular` 相当: `PairGranular`。normal (`hooke` / `hertz` / `hertz/material`)、
+     damping (`velocity` / `mass_velocity` / `viscoelastic` / `tsuji` / `coeff_restitution`)、
+     tangential (`linear_nohistory` / `linear_history` / `mindlin`) を組み合わせ指定。
+     未実装のサブモデル（JKR / DMT / MDR / rolling / twisting / heat）は明示的にエラーになります。
    - サブモデル: `RollingResistance` (EPSD), `TwistingResistance`, `CohesionJKR`。
 3. **EXTRA_FIX パッケージ**:
    - `FixNVESphere`: 速度Verlet並進・回転2段時間積分。
    - `FixGravity`, `FixWallGran`: 重力場加速度、平面壁面接触。
    - `FixDampingCundall`: Cundall局所非粘性減衰。
-   - `FixDeformPressure`: 目標等方圧密サーボ制御（セルおよび粒子のアフィン変形）。
+   - `FixDeformPressure`: LAMMPS `fix deform/pressure` 相当。軸ごとに
+     `pressure` / `pressure/mean` / `erate` / `trate` / `vel` / `final` / `scale` / `delta` / `volume`
+     を指定でき、ひずみ制御軸と圧力サーボ軸の混在（三軸試験）が可能。
+     `couple` / `max/rate` / `normalize/pressure` / `remap` 対応。
    - `FixViscousSphere`, `FixDrag`: Stokes粘性抵抗、流体抗力。
    - `FixFreeze`: 固定拘束粒子の運動ゼロ化。
    - `FixPrint`: 変数評価ファイルの定期追記出力。
 4. **熱力学量 (Computes)**:
-   - `Computes`: 並進・回転運動エネルギー、巨視的Virial応力テンソル、配位数集計。
-   - `ComputeStressAtom`: 各粒子局所Virial応力テンソル（6成分）。
+   - `Computes`: 並進・回転運動エネルギー、圧力テンソル、配位数集計。
+     Virial は接触ごとに `r_ij x f_ij` で積算されるため周期境界で並進不変です。
+     `kinetic=False` で `compute pressure NULL pair`（pairのみ）相当になります。
+   - `ComputeStressAtom`: 各粒子のVirial応力テンソル（6成分、pressure*volume単位）。
    - `ComputeFabric`: 接触異方性（2階ファブリックテンソル）。
    - `ComputeContactAtom`: 各粒子の配位数並列集計。
 5. **入出力 (I/O) & パーサー**:

@@ -683,7 +683,8 @@ class LAMMPSInputParser:
                         thermo_freq=self.thermo_freq,
                     )
 
-                fix_inst: Fix | None = None
+                # A plane wall/gran command can expand into two fixes (lo and hi).
+                fix_inst: Fix | list[Fix] | None = None
                 if fix_style == "nve/sphere":
                     if self.domain:
                         fix_inst = FixNVESphere(domain=self.domain)
@@ -1014,6 +1015,8 @@ class LAMMPSInputParser:
                     xmu = 0.0
                     dampflag = 1
                     wallstyle = None
+                    plane_axis = 2
+                    plane_bounds: list[float | None] = [None, None]
                     region_id = None
                     axis_str = "z"
                     c1 = 0.0
@@ -1063,7 +1066,16 @@ class LAMMPSInputParser:
                             i += 2
                         elif token in ("xplane", "yplane", "zplane"):
                             wallstyle = token
-                            # plane params: lo hi
+                            # plane params: lo hi, either of which may be NULL
+                            plane_axis = "xyz".index(token[0])
+                            for slot in range(2):
+                                if i + 1 + slot >= len(fix_args):
+                                    break
+                                tok = fix_args[i + 1 + slot]
+                                if tok.upper() != "NULL":
+                                    plane_bounds[slot] = float(
+                                        self.evaluate_expression(tok)
+                                    )
                             i += 3
                         elif token == "cylinder":
                             wallstyle = "cylinder"
@@ -1143,29 +1155,56 @@ class LAMMPSInputParser:
                             dampflag=dampflag,
                         )
                     else:
-                        # Default planar wall
-                        fix_inst = FixWallGran(
-                            domain=self.domain,
-                            wall_axis=2,
-                            wall_side=-1,
-                            wall_coord=0.0,
-                            kn=kn,
-                            gamman=gamman,
-                            kt=kt if kt is not None else 0.0,
-                            gammat=gammat if gammat is not None else 0.0,
-                            xmu=xmu,
-                        )
+                        # Plane wall(s). LAMMPS takes `<dim>plane lo hi`, either
+                        # of which may be NULL, and one fix serves both; here a
+                        # separate instance per wall adds up to the same forces.
+                        # NULL shorthands follow the pair styles: Kt = Kn*2/7,
+                        # gamma_t = gamma_n/2.
+                        kt_val = kt if kt is not None else kn * 2.0 / 7.0
+                        gammat_val = gammat if gammat is not None else 0.5 * gamman
+                        use_history = fstyle.endswith("history")
+                        if plane_bounds == [None, None]:
+                            plane_bounds = [
+                                float(self.domain.boxlo[plane_axis]),
+                                None,
+                            ]
+                        walls = []
+                        for slot, coord in enumerate(plane_bounds):
+                            if coord is None:
+                                continue
+                            walls.append(
+                                FixWallGran(
+                                    domain=self.domain,
+                                    wall_axis=plane_axis,
+                                    wall_side=-1 if slot == 0 else 1,
+                                    wall_coord=coord,
+                                    kn=kn,
+                                    gamman=gamman,
+                                    kt=kt_val,
+                                    gammat=gammat_val,
+                                    xmu=xmu,
+                                    dampflag=dampflag,
+                                    history=use_history,
+                                    max_atoms=(
+                                        self.atom.max_atoms if self.atom else 100000
+                                    ),
+                                )
+                            )
+                        fix_inst = walls[0] if len(walls) == 1 else list(walls)
 
                     self.fixes[fix_id] = fix_inst
-                    if self.simulation:
-                        self.simulation.add_fix(fix_inst)
+                    if self.simulation and fix_inst is not None:
+                        for one in fix_inst if isinstance(fix_inst, list) else [fix_inst]:
+                            self.simulation.add_fix(one)
 
             elif cmd == "unfix":
                 fix_id = args[0]
                 if fix_id in self.fixes:
                     inst = self.fixes.pop(fix_id)
-                    if self.simulation and inst in self.simulation.fixes:
-                        self.simulation.fixes.remove(inst)
+                    # A plane wall/gran command can expand into two fixes.
+                    for one in inst if isinstance(inst, list) else [inst]:
+                        if self.simulation and one in self.simulation.fixes:
+                            self.simulation.fixes.remove(one)
 
             elif cmd == "dump":
                 # dump <id> <group> custom <freq> <file> <args...>

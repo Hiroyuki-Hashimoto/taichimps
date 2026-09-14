@@ -18,6 +18,9 @@ class Fix(ABC):
     def __init__(self, domain: Domain | None = None, float_type: Any = ti.f64) -> None:
         self.domain = domain
         self.float_type = float_type
+        # LAMMPS clears this while update->setupflag is set, so the setup force
+        # evaluation does not advance any contact history a fix may hold.
+        self.history_update = True
 
     def setup(self, nsteps_total: int = 0) -> None:
         """
