@@ -11,6 +11,9 @@ import taichi as ti
 from taichimps.atom import AtomSystem
 from taichimps.domain import Domain
 
+# LAMMPS `units si`: force->boltz
+BOLTZMANN = 1.3806504e-23
+
 
 @ti.data_oriented
 class Computes:
@@ -142,6 +145,45 @@ class Computes:
             1 if kinetic else 0,
         )
         return self.virial_tensor.to_numpy() / vol
+
+    def kinetic_tensor(self, atom: AtomSystem) -> np.ndarray:
+        """
+        The kinetic energy tensor sum(m * v_a * v_b), as `compute temp` reports it.
+
+        Note the LAMMPS convention: no factor of 1/2, and in `units si`
+        mvv2e is 1 so no unit conversion either.
+        """
+        if atom.nlocal == 0:
+            return np.zeros(6, dtype=np.float64)
+        n = atom.nlocal
+        v = atom.v.to_numpy()[:n]
+        m = atom.rmass.to_numpy()[:n]
+        mv = m[:, None] * v
+        return np.array([
+            float(np.sum(mv[:, 0] * v[:, 0])),
+            float(np.sum(mv[:, 1] * v[:, 1])),
+            float(np.sum(mv[:, 2] * v[:, 2])),
+            float(np.sum(mv[:, 0] * v[:, 1])),
+            float(np.sum(mv[:, 0] * v[:, 2])),
+            float(np.sum(mv[:, 1] * v[:, 2])),
+        ])
+
+    def temperature(self, atom: AtomSystem) -> float:
+        """
+        Instantaneous temperature, as `compute temp` reports it.
+
+        t = sum(m v^2) / (dof * kB) with dof = 3N - 3, matching
+        ComputeTemp::dof_compute() for point-like degrees of freedom (the
+        rotational degrees of freedom of a sphere belong to compute
+        temp/sphere, not to this one).
+        """
+        if atom.nlocal == 0:
+            return 0.0
+        dof = 3.0 * atom.nlocal - 3.0
+        if dof <= 0.0:
+            return 0.0
+        tensor = self.kinetic_tensor(atom)
+        return float(np.sum(tensor[:3]) / (dof * BOLTZMANN))
 
     def compute_coordination_number(self, atom: AtomSystem, neighbor: Any) -> np.ndarray:
         """Compute coordination number (number of neighbors) per particle."""

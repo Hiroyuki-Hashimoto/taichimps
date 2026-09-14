@@ -8,12 +8,14 @@ import math
 import re
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, Literal
 
 import numpy as np
 import taichi as ti
 
 from taichimps.atom import AtomSystem
+from taichimps.computes.registry import ComputeVector, build_compute
 from taichimps.data_reader import read_data
 from taichimps.domain import Domain
 from taichimps.dump import DumpWriter
@@ -67,7 +69,11 @@ class LAMMPSInputParser:
         self.fixes: dict[str, Any] = {}
         self.dumps: dict[str, Any] = {}
         self.regions: dict[str, Any] = {}
+        # Named computes and atom-style variables, keyed by id / name.
+        self.computes: dict[str, Any] = {}
+        self.atom_var_exprs: dict[str, str] = {}
         self.custom_thermo_keys: list[str] = []
+        self.neighbor_skin: float = 0.001
         self.load_script()
 
     def evaluate_string_template(self, template_str: str) -> str:
@@ -105,7 +111,6 @@ class LAMMPSInputParser:
             # Solid volume and void ratio
             rad = self.atom.radius.to_numpy()[: self.atom.nlocal]
             solid_vol = float(np.sum(4.0 / 3.0 * np.pi * (rad**3)))
-            self.variables["c_4"] = solid_vol
             vol = float(self.domain.volume)
             self.variables["vol"] = vol
             self.variables["voidratio"] = (vol - solid_vol) / solid_vol if solid_vol > 0 else 0.0
@@ -116,42 +121,22 @@ class LAMMPSInputParser:
             self.variables["ke_rot"] = ke_r
             self.variables["ke_trans"] = ke_t
 
-            # Pressures
-            p_tensor = self.simulation.computes.compute_pressure_tensor(self.atom, self.domain)
-            self.variables["pxx"] = float(p_tensor[0])
-            self.variables["pyy"] = float(p_tensor[1])
-            self.variables["pzz"] = float(p_tensor[2])
-            self.variables["pxy"] = float(p_tensor[3])
-            self.variables["pxz"] = float(p_tensor[4])
-            self.variables["pyz"] = float(p_tensor[5])
-            p_mean = (p_tensor[0] + p_tensor[1] + p_tensor[2]) / 3.0
-            self.variables["p"] = float(p_mean)
-            # The *_p variables stand for the pair-only pressure, i.e. what
-            # `compute <id> all pressure NULL pair` reports: passing NULL for
-            # the temperature compute drops the kinetic term entirely.
-            p_pair = self.simulation.computes.compute_pressure_tensor(
-                self.atom, self.domain, kinetic=False
-            )
-            self.variables["pxx_p"] = float(p_pair[0])
-            self.variables["pyy_p"] = float(p_pair[1])
-            self.variables["pzz_p"] = float(p_pair[2])
-
-            # Energy
-            ke_t = self.simulation.computes.ke_trans(self.atom)
-            ke_r = self.simulation.computes.ke_rot(self.atom)
-            ke_tot = ke_t + ke_r
-            self.variables["c_5"] = ke_t
-            self.variables["KEtra"] = ke_t
-            self.variables["c_6"] = ke_r
-            self.variables["KErot"] = ke_r
-            self.variables["KEall"] = ke_tot
-
-            # Coordination number
-            nlist = self.neighbor or self.simulation.neighbor
-            coord_nums = self.simulation.computes.compute_coordination_number(self.atom, nlist)
-            cn_mean = float(np.mean(coord_nums[:self.atom.nlocal])) if self.atom.nlocal > 0 else 0.0
-            self.variables["c_3"] = cn_mean
-            self.variables["cn"] = cn_mean
+            # Named computes. LAMMPS exposes these as c_<id>, and a vector
+            # compute's components as c_<id>[i], 1-based.
+            ctx = self.compute_context()
+            for cid, comp in self.computes.items():
+                # Prefer the vector form: ComputeVector is a float carrying the
+                # components, so it serves both `c_ID` and `c_ID[i]`.
+                try:
+                    self.variables[f"c_{cid}"] = comp.vector(ctx)
+                    continue
+                except TypeError:
+                    pass
+                try:
+                    self.variables[f"c_{cid}"] = comp.scalar(ctx)
+                except TypeError:
+                    # per-atom only; referenced through compute reduce
+                    self.variables.pop(f"c_{cid}", None)
 
             # Also evaluate any equal variables that depend on dynamic variables
             # e.g. variable e equal (${vol}-${Vs})/${Vs}
@@ -410,6 +395,96 @@ class LAMMPSInputParser:
 
         return kn, kt, gamman, gammat, xmu, dampflag, limit_damping
 
+    # ------------------------------------------------------------- computes
+
+    def _ensure_neighbor(self) -> NeighborList | None:
+        """
+        The neighbor list a Simulation should use.
+
+        Both Simulation construction sites used to let Simulation build its own,
+        which quietly discarded whatever `neighbor` and `neigh_modify` had
+        configured -- the skin, and the delay/every/check settings.
+        """
+        if self.neighbor is None and self.domain is not None and self.atom is not None:
+            self.neighbor = NeighborList(
+                domain=self.domain,
+                max_atoms=self.atom.max_atoms,
+                skin=self.neighbor_skin,
+            )
+        return self.neighbor
+
+    def compute_context(self) -> Any:
+        """
+        What a compute needs to evaluate itself.
+
+        The neighbor list may live on the parser or on the Simulation depending
+        on how the script was written, so it is resolved here rather than in
+        each compute.
+        """
+        return SimpleNamespace(
+            atom=self.atom,
+            domain=self.domain,
+            neighbor=self.neighbor
+            or (self.simulation.neighbor if self.simulation else None),
+        )
+
+    def _atom_values(self, name: str) -> np.ndarray:
+        """
+        Per-atom values of an atom-style variable or a bare atom property.
+
+        LAMMPS lets `variable v atom "<expr>"` refer to atom properties by name;
+        the same names work here, evaluated over numpy arrays.
+        """
+        assert self.atom is not None
+        n = self.atom.nlocal
+        x = self.atom.x.to_numpy()[:n]
+        v = self.atom.v.to_numpy()[:n]
+        omega = self.atom.omega.to_numpy()[:n]
+        env: dict[str, Any] = {
+            "x": x[:, 0], "y": x[:, 1], "z": x[:, 2],
+            "vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2],
+            "omegax": omega[:, 0], "omegay": omega[:, 1], "omegaz": omega[:, 2],
+            "radius": self.atom.radius.to_numpy()[:n],
+            "mass": self.atom.rmass.to_numpy()[:n],
+            "id": self.atom.tag.to_numpy()[:n],
+            "type": self.atom.atom_type.to_numpy()[:n],
+            "PI": math.pi, "pi": math.pi,
+            "sqrt": np.sqrt, "exp": np.exp, "log": np.log, "abs": np.abs,
+            "sin": np.sin, "cos": np.cos, "tan": np.tan,
+        }
+        for key, value in self.variables.items():
+            if isinstance(value, (int, float)):
+                env.setdefault(key, value)
+
+        expr = self.atom_var_exprs[name]
+        result = eval(expr, {"__builtins__": None}, env)
+        return np.broadcast_to(np.asarray(result, dtype=np.float64), (n,))
+
+    def resolve_reduce_input(self, token: str, _ctx: Any) -> np.ndarray:
+        """Resolve a `compute reduce` input: c_ID, c_ID[i] or v_name."""
+        if token.startswith("v_"):
+            name = token[2:]
+            if name in self.atom_var_exprs:
+                return self._atom_values(name)
+            return np.array([self.evaluate_variable(name)])
+        if token.startswith("c_"):
+            body = token[2:]
+            index = None
+            if body.endswith("]") and "[" in body:
+                body, _, idx = body.partition("[")
+                index = int(idx.rstrip("]"))
+            comp = self.computes.get(body)
+            if comp is None:
+                raise ValueError(f"compute reduce refers to unknown compute {body!r}")
+            ctx = self.compute_context()
+            if index is None:
+                return np.asarray(comp.per_atom(ctx), dtype=np.float64)
+            values = comp.per_atom(ctx)
+            return np.asarray(values, dtype=np.float64)[:, index - 1]
+        raise ValueError(
+            f"compute reduce input {token!r} must be c_ID, c_ID[i] or v_name"
+        )
+
     def evaluate_variable(self, name: str) -> float:
         """
         Current value of a variable, re-evaluating an equal-style expression.
@@ -432,6 +507,11 @@ class LAMMPSInputParser:
 
     def evaluate_expression(self, expr_str: str) -> float | str:
         """Evaluate a mathematical expression or resolve variables."""
+        # LAMMPS scripts commonly quote an expression, e.g.
+        #   variable pxx_p equal 'c_1[1]'
+        expr_str = expr_str.strip()
+        if len(expr_str) >= 2 and expr_str[0] == expr_str[-1] and expr_str[0] in "\"'":
+            expr_str = expr_str[1:-1]
         # Substitute ${var}
         def sub_var(match: re.Match) -> str:
             var_name = match.group(1)
@@ -454,7 +534,9 @@ class LAMMPSInputParser:
             "abs": abs,
         }
         for k, v in self.variables.items():
-            if isinstance(v, (int, float)):
+            # ComputeVector is indexable 1-based so that `c_1[1]` in a script
+            # means the first component, as it does in LAMMPS.
+            if isinstance(v, (int, float, ComputeVector)):
                 allowed_names[k] = v
 
         try:
@@ -538,20 +620,39 @@ class LAMMPSInputParser:
                     expr = "".join(args[2:])
                     self.variable_exprs[var_name] = expr
                     self.variables[var_name] = self.evaluate_expression(expr)
+                elif var_style == "atom":
+                    # Per-atom expression, evaluated lazily over numpy arrays.
+                    self.atom_var_exprs[var_name] = "".join(args[2:]).strip('"\'')
                 elif var_style == "string":
                     self.variables[var_name] = args[2]
                 else:
                     self.variables[var_name] = args[2]
+
+            elif cmd == "compute":
+                # compute <id> <group> <style> <args...>
+                self.computes[args[0]] = build_compute(
+                    args[0], args[2:], self.resolve_reduce_input
+                )
 
             elif cmd == "boundary":
                 # boundary p p p
                 if len(args) >= 3 and self.domain:
                     self.domain.set_boundary((args[0], args[1], args[2]))
 
+            elif cmd == "neighbor":
+                # neighbor <skin> <style>
+                self.neighbor_skin = float(self.evaluate_expression(args[0]))
+                if self.neighbor is not None:
+                    self.neighbor.skin = self.neighbor_skin
+
             elif cmd == "neigh_modify":
                 # Parse neigh_modify arguments: delay <n>, every <n>, check <yes/no>
                 if self.neighbor is None and self.domain is not None and self.atom is not None:
-                    self.neighbor = NeighborList(domain=self.domain, max_atoms=self.atom.max_atoms)
+                    self.neighbor = NeighborList(
+                        domain=self.domain,
+                        max_atoms=self.atom.max_atoms,
+                        skin=self.neighbor_skin,
+                    )
                 i_arg = 0
                 while i_arg < len(args):
                     keyword = args[i_arg]
@@ -591,6 +692,10 @@ class LAMMPSInputParser:
                     radius=data.radius,
                     density=data.density,
                     v=data.v,
+                    # The Velocities section of a sphere data file carries
+                    # angular velocity too; dropping it silently started every
+                    # run from omega = 0.
+                    omega=data.omega,
                     atom_type=data.atom_type,
                     tag=data.tag,
                 )
@@ -762,6 +867,7 @@ class LAMMPSInputParser:
                     self.simulation = Simulation(
                         domain=self.domain,
                         atom=self.atom,
+                        neighbor=self._ensure_neighbor(),
                         pair=self.pair_style,
                         dt=self.dt,
                         thermo_freq=self.thermo_freq,
@@ -1311,6 +1417,7 @@ class LAMMPSInputParser:
                     self.simulation = Simulation(
                         domain=self.domain,
                         atom=self.atom,
+                        neighbor=self._ensure_neighbor(),
                         pair=self.pair_style,
                         dt=self.dt,
                         thermo_freq=self.thermo_freq,

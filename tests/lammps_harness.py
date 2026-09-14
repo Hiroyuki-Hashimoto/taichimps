@@ -97,6 +97,8 @@ def build_input(
     extra_fixes: str = "",
     pre_pair: str = "",
     box_tilt_large: bool = False,
+    thermo_extra: str = "",
+    pre_thermo: str = "",
 ) -> str:
     """
     A minimal granular input.
@@ -136,8 +138,11 @@ compute vir all pressure NULL pair
 dump 1 all custom 1 dump.out {' '.join(DUMP_FIELDS)}
 dump_modify 1 sort id format float %.17e
 
+{pre_thermo}
 thermo 1
-thermo_style custom step lx ly lz c_vir[1] c_vir[2] c_vir[3]
+thermo_style custom step lx ly lz c_vir[1] c_vir[2] c_vir[3] {thermo_extra}
+# thermo_style resets the formats, so this has to come after it.
+thermo_modify format float %.17g
 
 run {steps}
 """
@@ -183,6 +188,8 @@ def run_lammps(
     pre_pair: str = "",
     tilt: tuple[float, float, float] | None = None,
     box_tilt_large: bool = False,
+    thermo_extra: str = "",
+    pre_thermo: str = "",
 ) -> list[dict[str, np.ndarray]]:
     """Run LAMMPS in `workdir` and return the parsed dump frames."""
     exe = lmp_executable()
@@ -196,7 +203,7 @@ def run_lammps(
     (workdir / "in.parity").write_text(
         build_input(
             pair_style, pair_coeff, steps, dt, skin, boundary, integrate,
-            extra_fixes, pre_pair, box_tilt_large,
+            extra_fixes, pre_pair, box_tilt_large, thermo_extra, pre_thermo,
         )
     )
 

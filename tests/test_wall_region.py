@@ -139,7 +139,11 @@ def test_fix_wall_gran_region_friction_and_torque():
         kt=0.0,
         gammat=gammat,
         xmu=xmu,
-        dampflag=0,
+        # In LAMMPS dampflag = 0 zeroes the tangential damping coefficient
+        # outright; it does not mean "skip the meff factor", which is what this
+        # test previously assumed. rmass is 1.0 here, so with dampflag = 1 the
+        # meff scaling is invisible and the expected values below still hold.
+        dampflag=1,
     )
 
     x_np = np.zeros((10, 3), dtype=np.float64)

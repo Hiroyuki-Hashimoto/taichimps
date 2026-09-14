@@ -31,20 +31,25 @@ class ComputeContactAtom:
         # same way here as in the pair styles; the hand-rolled per-axis version
         # this replaced had no tilt corrections at all.
         for i in range(nlocal):
+            self.contact_count[i] = 0
+
+        # The neighbor list is a half list (only j > i), while LAMMPS builds
+        # this compute on a full list where every contact is seen from both
+        # sides. Each contact therefore has to be tallied to both partners;
+        # counting it only for the lower index returned exactly half the
+        # coordination number.
+        for i in range(nlocal):
             xi = x[i]
             ri = radius[i]
             n_i = num_neigh[i]
-            cnt = 0
             for k in range(n_i):
                 j = neighbors[i, k]
-                xj = x[j]
-                rj = radius[j]
-                d = domain.minimum_image(xi - xj)
+                d = domain.minimum_image(xi - x[j])
                 rsq = d.dot(d)
-                radsum = ri + rj
+                radsum = ri + radius[j]
                 if rsq < radsum * radsum and rsq > 1e-18:
-                    cnt += 1
-            self.contact_count[i] = cnt
+                    ti.atomic_add(self.contact_count[i], 1)
+                    ti.atomic_add(self.contact_count[j], 1)
 
     def compute(self, atom: AtomSystem, domain: Domain, neighbor: NeighborList) -> np.ndarray:
         if atom.nlocal == 0:
