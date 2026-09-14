@@ -32,6 +32,7 @@ from taichimps.atom import AtomSystem
 from taichimps.contact_history import ContactHistory
 from taichimps.domain import Domain
 from taichimps.EXTRA_FIX.nve_sphere import FixNVESphere
+from taichimps.GRANULAR.granular import PairGranular
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
 from taichimps.neighbor import NeighborList
 from taichimps.simulation import Simulation
@@ -77,7 +78,31 @@ def _config(seed: int, n_side: int = 3):
     return x, radius, density, v, omega
 
 
-def _run_taichimps(x, radius, density, v, omega, steps):
+# hertz/material + mindlin + coeff_restitution, the combination the reference
+# triaxial inputs in lammps-work/ actually use.
+EMOD = 71.6e9
+POISS = 0.23
+COR = 0.95
+FRIC = 0.3
+
+
+def _make_pair(domain, style):
+    if style == "hooke_history":
+        return GranHookeHistory(
+            domain=domain, kn=KN, gamman=GAMMAN, kt=KT, gammat=GAMMAT,
+            xmu=XMU, dampflag=1,
+        )
+    return PairGranular(
+        domain=domain,
+        normal="hertz/material",
+        normal_coeffs=[EMOD, COR, POISS],
+        tangential="mindlin",
+        tangential_coeffs=[None, 1.0, FRIC],
+        damping="coeff_restitution",
+    )
+
+
+def _run_taichimps(x, radius, density, v, omega, steps, style="hooke_history"):
     domain = Domain(
         boxlo=[0.0, 0.0, 0.0], boxhi=[BOX, BOX, BOX], boundary=("p", "p", "p")
     )
@@ -91,9 +116,7 @@ def _run_taichimps(x, radius, density, v, omega, steps):
     neighbor.check = False
     neighbor.every = 1
     history = ContactHistory(max_atoms=n, max_neighbors=64)
-    pair = GranHookeHistory(
-        domain=domain, kn=KN, gamman=GAMMAN, kt=KT, gammat=GAMMAT, xmu=XMU, dampflag=1
-    )
+    pair = _make_pair(domain, style)
     sim = Simulation(
         domain=domain, atom=atom, neighbor=neighbor, history=history, pair=pair, dt=DT
     )
@@ -147,3 +170,42 @@ def test_hooke_history_matches_lammps(tmp_path, steps):
 
     _assert_close(f_got, f_ref, "force")
     _assert_close(tq_got, tq_ref, "torque")
+
+
+@pytest.mark.parametrize("steps", [0, 1, 25])
+def test_granular_hertz_mindlin_matches_lammps(tmp_path, steps):
+    """
+    The pair_style granular combination used by the reference triaxial inputs:
+    hertz/material for the normal force, mindlin for the tangential history and
+    coeff_restitution damping. None of this was implemented (or even parsed)
+    before; pair_style granular scripts ran with no contact forces at all.
+    """
+    x, radius, density, v, omega = _config(seed=5)
+
+    coeff = (
+        f"* * hertz/material {EMOD} {COR} {POISS} "
+        f"tangential mindlin NULL 1.0 {FRIC} damping coeff_restitution"
+    )
+    frames = run_lammps(
+        tmp_path / f"lmp_gran_{steps}",
+        x=x,
+        radius=radius,
+        density=density,
+        v=v,
+        omega=omega,
+        boxlo=(0.0, 0.0, 0.0),
+        boxhi=(BOX, BOX, BOX),
+        pair_style="granular",
+        pair_coeff=coeff,
+        steps=steps,
+        dt=DT,
+        skin=SKIN,
+    )
+    ref = frames[-1]
+
+    f_got, tq_got = _run_taichimps(
+        x, radius, density, v, omega, steps, style="granular"
+    )
+
+    _assert_close(f_got, force_array(ref), "force")
+    _assert_close(tq_got, torque_array(ref), "torque")

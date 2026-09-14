@@ -5,10 +5,10 @@ from taichimps.atom import AtomSystem
 from taichimps.contact_history import ContactHistory
 from taichimps.domain import Domain
 from taichimps.EXTRA_FIX.wall_gran import FixWallGran
+from taichimps.GRANULAR.granular import PairGranular
 from taichimps.GRANULAR.hertz import GranHertz
 from taichimps.GRANULAR.hertz_history import GranHertzHistory
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
-from taichimps.GRANULAR.modular import GranularModular
 from taichimps.neighbor import NeighborList
 
 
@@ -67,7 +67,7 @@ def test_hertz_and_history():
     assert f2[0, 0] < 0.0
 
 
-def test_modular_and_wall():
+def test_pair_granular_and_wall():
     domain = Domain(boxlo=[0.0, 0.0, 0.0], boxhi=[10.0, 10.0, 10.0])
     atom = AtomSystem(max_atoms=10)
     atom.add_particles(
@@ -88,5 +88,10 @@ def test_modular_and_wall():
     assert f[0, 0] > 0.0
 
     atom.f.fill(0.0)
-    mod = GranularModular(domain=domain, kn=1000.0, gamman=0.0, kt=0.0, gammat=0.0, xmu=0.0)
+    mod = PairGranular(
+        domain=domain,
+        normal="hooke",
+        normal_coeffs=[1000.0, 0.0],
+        damping="mass_velocity",
+    )
     mod.compute(atom=atom, nlist=nlist, history=history, dt=0.001)

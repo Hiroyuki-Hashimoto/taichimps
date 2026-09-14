@@ -8,7 +8,7 @@ import math
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 import taichi as ti
@@ -32,6 +32,7 @@ from taichimps.EXTRA_TAICHI.probe import FixProbe
 from taichimps.EXTRA_TAICHI.sponge import WinSponge
 from taichimps.EXTRA_TAICHI.triaxial import FixTriaxial
 from taichimps.EXTRA_TAICHI.wave import FixWave
+from taichimps.GRANULAR.granular import PairGranular
 from taichimps.GRANULAR.hertz_history import GranHertzHistory
 from taichimps.GRANULAR.hooke import GranHooke
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
@@ -153,6 +154,90 @@ class LAMMPSInputParser:
                 vs = float(self.variables["Vs"])
                 if vs > 0.0:
                     self.variables["e"] = (self.domain.volume - vs) / vs
+
+    # Coefficient counts per sub-model, from the LAMMPS num_coeffs fields in
+    # gran_sub_mod_{normal,damping,tangential}.cpp.
+    _GRANULAR_NCOEFF: ClassVar[dict[str, dict[str, int]]] = {
+        "normal": {"hooke": 2, "hertz": 2, "hertz/material": 3, "none": 0},
+        "tangential": {
+            "none": 0,
+            "linear_nohistory": 2,
+            "linear_history": 3,
+            "mindlin": 3,
+        },
+        "damping": {
+            "none": 0,
+            "velocity": 0,
+            "mass_velocity": 0,
+            "viscoelastic": 0,
+            "tsuji": 0,
+            "coeff_restitution": 0,
+        },
+    }
+
+    def _parse_pair_coeff_granular(self, args: list[str]) -> PairGranular:
+        """
+        Parse `pair_coeff <i> <j> <normal> <coeffs...> [tangential ...] [damping ...]`.
+
+        Follows PairGranular::coeff(): the normal model is mandatory and comes
+        first without a keyword, the rest are introduced by their category
+        keyword, and an unspecified damping model defaults to `viscoelastic`.
+        Per-type coefficients are not supported yet, so the type selectors are
+        accepted but every pair uses the same model.
+        """
+        if self.domain is None:
+            raise ValueError("pair_coeff before the simulation box was defined")
+        if len(args) < 3:
+            raise ValueError("pair_coeff granular needs at least a normal model")
+
+        def take(name: str, category: str, idx: int) -> tuple[list[float | None], int]:
+            table = self._GRANULAR_NCOEFF[category]
+            if name not in table:
+                raise ValueError(
+                    f"Unsupported pair granular {category} model {name!r}; "
+                    f"implemented: {sorted(table)}"
+                )
+            n = table[name]
+            if idx + n > len(args):
+                raise ValueError(f"pair_coeff granular: {name} needs {n} coefficients")
+            vals: list[float | None] = [
+                None if tok == "NULL" else float(self.evaluate_expression(tok))
+                for tok in args[idx : idx + n]
+            ]
+            return vals, idx + n
+
+        i = 2
+        normal_name = args[i]
+        normal_coeffs, i = take(normal_name, "normal", i + 1)
+
+        tangential_name = "none"
+        tangential_coeffs: list[float | None] = []
+        damping_name = "viscoelastic"
+        limit_damping = False
+
+        while i < len(args):
+            key = args[i]
+            if key == "tangential":
+                tangential_name = args[i + 1]
+                tangential_coeffs, i = take(tangential_name, "tangential", i + 2)
+            elif key == "damping":
+                damping_name = args[i + 1]
+                _, i = take(damping_name, "damping", i + 2)
+            elif key == "limit_damping":
+                limit_damping = True
+                i += 1
+            else:
+                raise ValueError(f"Unsupported pair_coeff granular keyword: {key!r}")
+
+        return PairGranular(
+            domain=self.domain,
+            normal=normal_name,
+            normal_coeffs=[c for c in normal_coeffs if c is not None],
+            tangential=tangential_name,
+            tangential_coeffs=tangential_coeffs,
+            damping=damping_name,
+            limit_damping=limit_damping,
+        )
 
     def _parse_gran_settings(
         self, args: list[str]
@@ -478,6 +563,17 @@ class LAMMPSInputParser:
                             gammat=gammat, xmu=xmu, dampflag=dampflag,
                             limit_damping=limit_damping,
                         )
+                elif style_name == "granular":
+                    # All model choices live in pair_coeff for this style, so
+                    # the pair style itself is only built once that arrives.
+                    self.pair_style = None
+
+            elif cmd == "pair_coeff":
+                if self.domain is None:
+                    continue
+                self.pair_style = self._parse_pair_coeff_granular(args)
+                if self.simulation is not None:
+                    self.simulation.set_pair_style(self.pair_style)
 
             elif cmd == "fix":
                 fix_id = args[0]
