@@ -108,7 +108,17 @@ class Simulation:
         """
         if self.neighbor is None:
             return False
-        if not self.neighbor.decide(self.atom, self.timestep):
+
+        # A fix may demand a rebuild regardless of the displacement check: a
+        # box flip leaves atoms outside the relabelled cell until they are
+        # wrapped, and binning would place them wrongly in the meantime.
+        forced = False
+        for fix in self.fixes:
+            if fix.force_reneighbor:
+                forced = True
+                fix.force_reneighbor = False
+
+        if not self.neighbor.decide(self.atom, self.timestep) and not forced:
             return False
 
         if self.history is not None:

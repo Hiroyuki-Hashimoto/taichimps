@@ -16,6 +16,8 @@ class LAMMPSData:
     natom_types: int
     boxlo: list[float]
     boxhi: list[float]
+    # [xy, xz, yz]; all zero for an orthogonal box.
+    tilt: list[float]
     x: np.ndarray
     radius: np.ndarray
     density: np.ndarray
@@ -36,6 +38,7 @@ def read_data(filepath: str | Path) -> LAMMPSData:
     natoms = 0
     natom_types = 1
     xlo = ylo = zlo = 0.0
+    xy = xz = yz = 0.0
     xhi = yhi = zhi = 1.0
 
     sections: dict[str, list[str]] = {}
@@ -74,6 +77,9 @@ def read_data(filepath: str | Path) -> LAMMPSData:
             ylo, yhi = float(tokens[0]), float(tokens[1])
         elif len(tokens) >= 4 and tokens[2] == "zlo" and tokens[3] == "zhi":
             zlo, zhi = float(tokens[0]), float(tokens[1])
+        elif len(tokens) >= 6 and tokens[3:6] == ["xy", "xz", "yz"]:
+            # A triclinic data file carries the tilt factors after zlo zhi.
+            xy, xz, yz = (float(t) for t in tokens[0:3])
 
     atom_lines = sections.get("atoms", [])
     actual_natoms = len(atom_lines)
@@ -124,6 +130,7 @@ def read_data(filepath: str | Path) -> LAMMPSData:
         natoms=actual_natoms,
         natom_types=natom_types,
         boxlo=[xlo, ylo, zlo],
+        tilt=[xy, xz, yz],
         boxhi=[xhi, yhi, zhi],
         x=x,
         radius=radii,

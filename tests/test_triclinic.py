@@ -19,12 +19,21 @@ import taichi as ti
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lammps_harness import force_array, lmp_executable, run_lammps, torque_array
+from lammps_harness import (
+    box_from_bound,
+    force_array,
+    lmp_executable,
+    parse_box,
+    parse_tilt,
+    run_lammps,
+    torque_array,
+)
 
 from taichimps.atom import AtomSystem
 from taichimps.computes.thermo import Computes
 from taichimps.contact_history import ContactHistory
 from taichimps.domain import Domain
+from taichimps.EXTRA_FIX.deform_pressure import FixDeformPressure
 from taichimps.EXTRA_FIX.nve_sphere import FixNVESphere
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
 from taichimps.neighbor import NeighborList
@@ -247,3 +256,133 @@ def test_minimum_image_is_periodic_in_the_tilted_lattice():
     assert scale > 0.0, "test packing produced no contacts"
     np.testing.assert_allclose(f_got, f_ref, atol=1e-9 * scale)
     np.testing.assert_allclose(tq_got, tq_ref, atol=1e-9 * np.abs(tq_ref).max())
+
+
+# --------------------------------------------------------------------------
+# Shearing the cell with fix deform
+# --------------------------------------------------------------------------
+
+
+def _run_sheared(lam, radius, density, v, omega, rate, steps, flip=True):
+    """Simple shear: xy grows at a constant engineering shear-strain rate."""
+    domain = Domain(
+        boxlo=[0.0, 0.0, 0.0], boxhi=[BOX, BOX, BOX], boundary=("p", "p", "p")
+    )
+    n = len(lam)
+    atom = AtomSystem(max_atoms=n)
+    atom.add_particles(
+        x=_cartesian(lam, (0.0, 0.0, 0.0)), radius=radius, density=density,
+        v=v, omega=omega,
+    )
+    neighbor = NeighborList(
+        domain=domain, max_atoms=n, max_neighbors_per_atom=64, skin=SKIN
+    )
+    neighbor.check = False
+    neighbor.every = 1
+    history = ContactHistory(max_atoms=n, max_neighbors=64)
+    pair = GranHookeHistory(
+        domain=domain, kn=KN, gamman=GAMMAN, kt=KT, gammat=GAMMAT, xmu=XMU, dampflag=1
+    )
+    sim = Simulation(
+        domain=domain, atom=atom, neighbor=neighbor, history=history, pair=pair, dt=DT
+    )
+    sim.add_fix(FixNVESphere(domain=domain))
+    sim.add_fix(
+        FixDeformPressure(
+            domain=domain,
+            axes={"xy": {"style": "erate", "rate": rate}},
+            nevery=1,
+            flip=flip,
+        )
+    )
+    sim.run(steps)
+    return (
+        domain,
+        atom.f.to_numpy()[:n].copy(),
+        atom.torque.to_numpy()[:n].copy(),
+    )
+
+
+def _lammps_sheared(tmp_path, cfg, rate, steps, box_tilt_large=False):
+    lam, radius, density, v, omega = cfg
+    run_lammps(
+        tmp_path,
+        x=_cartesian(lam, (0.0, 0.0, 0.0)),
+        radius=radius,
+        density=density,
+        v=v,
+        omega=omega,
+        boxlo=(0.0, 0.0, 0.0),
+        boxhi=(BOX, BOX, BOX),
+        tilt=(0.0, 0.0, 0.0),
+        pair_style=f"gran/hooke/history {KN} {KT} {GAMMAN} {GAMMAT} {XMU} 1",
+        steps=steps,
+        dt=DT,
+        skin=SKIN,
+        extra_fixes=f"fix d all deform 1 xy erate {rate} units box",
+        box_tilt_large=box_tilt_large,
+    )
+    dump = tmp_path / "dump.out"
+    frames_tilt = parse_tilt(dump)
+    bounds = parse_box(dump)
+    return bounds[-1], frames_tilt[-1], dump
+
+
+@pytest.mark.skipif(lmp_executable() is None, reason="no LAMMPS executable available")
+def test_simple_shear_matches_lammps(tmp_path):
+    """
+    `fix deform xy erate` against LAMMPS: tilt history and the resulting forces.
+
+    Without tilt control this could not be expressed at all.
+    """
+    cfg = _config(seed=31)
+    rate, steps = 4.0e3, 25
+
+    bound, tilt_ref, dump = _lammps_sheared(tmp_path / "lmp", cfg, rate, steps)
+    box_ref = box_from_bound(bound, tilt_ref)
+
+    domain, f_got, tq_got = _run_sheared(*cfg, rate=rate, steps=steps)
+
+    # The tilt must track LAMMPS, and must actually have moved.
+    assert tilt_ref[0] > 0.05 * BOX, "LAMMPS barely sheared; the test is not probing much"
+    np.testing.assert_allclose(domain.tilt[0], tilt_ref[0], rtol=1e-9)
+    np.testing.assert_allclose(domain.prd, box_ref[:, 1] - box_ref[:, 0], rtol=1e-9)
+
+    from lammps_harness import parse_dump
+
+    ref = parse_dump(dump)[-1]
+    _assert_close(f_got, force_array(ref), "force")
+    _assert_close(tq_got, torque_array(ref), "torque")
+
+
+@pytest.mark.skipif(lmp_executable() is None, reason="no LAMMPS executable available")
+def test_box_flip_matches_lammps(tmp_path):
+    """
+    Shear far enough that the cell has to be relabelled, and keep matching.
+
+    LAMMPS flips when a tilt passes half its box length, and tracks image flags
+    to keep atoms with the cell. taichimps has no image flags; it relabels the
+    edges and asks for a rebuild, whose wrap puts atoms back inside. The forces
+    are invariant under those periodic shifts, so they must still agree.
+    """
+    cfg = _config(seed=37)
+    # 0.6 of a box length of tilt over the run, i.e. past the 0.5 flip threshold.
+    steps = 60
+    rate = 0.6 / (steps * DT)
+
+    _bound, tilt_ref, dump = _lammps_sheared(
+        tmp_path / "lmp", cfg, rate, steps, box_tilt_large=True
+    )
+
+    domain, f_got, tq_got = _run_sheared(*cfg, rate=rate, steps=steps)
+
+    # LAMMPS should have flipped: the reported tilt ends up negative even
+    # though the shear rate is positive.
+    assert tilt_ref[0] < 0.0, "LAMMPS did not flip; raise the shear rate"
+    np.testing.assert_allclose(domain.tilt[0], tilt_ref[0], atol=1e-12 * BOX)
+
+    from lammps_harness import parse_dump
+
+    ref = parse_dump(dump)[-1]
+    _assert_close(f_got, force_array(ref), "force")
+    _assert_close(tq_got, torque_array(ref), "torque")

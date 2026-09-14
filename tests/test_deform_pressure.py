@@ -72,7 +72,7 @@ def _config(seed: int = 13, n_side: int = 3):
     )
 
 
-def _run_taichimps(x, radius, density, v, omega, axes, couple, steps):
+def _run_taichimps(x, radius, density, v, omega, axes, couple, steps, **kwargs):
     domain = Domain(
         boxlo=[0.0, 0.0, 0.0], boxhi=[BOX, BOX, BOX], boundary=("p", "p", "p")
     )
@@ -94,7 +94,8 @@ def _run_taichimps(x, radius, density, v, omega, axes, couple, steps):
     sim.add_fix(FixNVESphere(domain=domain))
     sim.add_fix(
         FixDeformPressure(
-            domain=domain, axes=axes, couple=couple, max_rate=MAXRATE, nevery=1
+            domain=domain, axes=axes, couple=couple, max_rate=MAXRATE, nevery=1,
+            **kwargs,
         )
     )
     sim.run(steps)
@@ -220,3 +221,136 @@ def test_remap_keeps_particles_placed_relative_to_the_box():
     # Fractional coordinates are what an affine remap preserves.
     np.testing.assert_allclose((pos[0] - lo) / prd, [0.5] * 3, atol=1e-12)
     np.testing.assert_allclose((pos[1] - lo) / prd, [0.25] * 3, atol=1e-12)
+
+
+# --------------------------------------------------------------------------
+# The remaining LAMMPS deform styles
+# --------------------------------------------------------------------------
+
+pytestmark_lmp = pytest.mark.skipif(
+    lmp_executable() is None, reason="no LAMMPS executable available"
+)
+
+
+@pytestmark_lmp
+def test_box_volume_holds_the_volume(tmp_path):
+    """
+    `box volume` rescales the whole cell back to its starting volume after the
+    per-axis styles have had their say.
+    """
+    cfg = _config(seed=41)
+    rate = -2.0e3
+    deform = f"fix 2 all deform/pressure 1 z trate {rate} box volume"
+    prd_ref = _lammps_box(tmp_path / "lmp", cfg, deform, STEPS)
+
+    prd_got = _run_taichimps(
+        *cfg,
+        axes={"z": {"style": "trate", "rate": rate}},
+        couple="none",
+        steps=STEPS,
+        box={"style": "volume"},
+    )
+
+    np.testing.assert_allclose(np.prod(prd_ref), BOX**3, rtol=1e-9)
+    assert abs(prd_ref[2] / BOX - 1.0) > 1e-3, "the axial strain barely moved"
+    np.testing.assert_allclose(prd_got, prd_ref, rtol=1e-9)
+
+
+@pytestmark_lmp
+def test_box_pressure_matches_lammps(tmp_path):
+    """`box pressure` servos the mean pressure by scaling the cell isotropically."""
+    cfg = _config(seed=43)
+    deform = (
+        f"fix 2 all deform/pressure 1 box pressure {PTARGET} {PGAIN} "
+        f"max/rate {MAXRATE}"
+    )
+    prd_ref = _lammps_box(tmp_path / "lmp", cfg, deform, STEPS)
+
+    prd_got = _run_taichimps(
+        *cfg,
+        axes={},
+        couple="none",
+        steps=STEPS,
+        box={"style": "pressure", "ptarget": PTARGET, "pgain": PGAIN},
+    )
+
+    assert abs(prd_ref[0] / BOX - 1.0) > 1e-4, "the box barely moved"
+    np.testing.assert_allclose(prd_got, prd_ref, rtol=1e-9)
+
+
+@pytestmark_lmp
+def test_volume_style_matches_lammps(tmp_path):
+    """One axis strained, the other two holding the volume constant."""
+    cfg = _config(seed=47)
+    rate = -2.0e3
+    deform = f"fix 2 all deform/pressure 1 z trate {rate} x volume y volume"
+    prd_ref = _lammps_box(tmp_path / "lmp", cfg, deform, STEPS)
+
+    prd_got = _run_taichimps(
+        *cfg,
+        axes={
+            "z": {"style": "trate", "rate": rate},
+            "x": {"style": "volume"},
+            "y": {"style": "volume"},
+        },
+        couple="none",
+        steps=STEPS,
+    )
+
+    np.testing.assert_allclose(np.prod(prd_ref), BOX**3, rtol=1e-9)
+    np.testing.assert_allclose(prd_got, prd_ref, rtol=1e-9)
+
+
+@pytestmark_lmp
+def test_vol_balance_p_matches_lammps(tmp_path):
+    """
+    `vol/balance/p`: the two volume-preserving axes split their strain so that
+    their pressures converge, instead of straining equally.
+    """
+    cfg = _config(seed=53)
+    rate = -2.0e3
+    deform = (
+        f"fix 2 all deform/pressure 1 z trate {rate} x volume y volume "
+        f"vol/balance/p yes max/rate {MAXRATE}"
+    )
+    prd_ref = _lammps_box(tmp_path / "lmp", cfg, deform, STEPS)
+
+    prd_got = _run_taichimps(
+        *cfg,
+        axes={
+            "z": {"style": "trate", "rate": rate},
+            "x": {"style": "volume"},
+            "y": {"style": "volume"},
+        },
+        couple="none",
+        steps=STEPS,
+        vol_balance_p=True,
+    )
+
+    np.testing.assert_allclose(np.prod(prd_ref), BOX**3, rtol=1e-8)
+    # The balancer must do something different from the plain 50/50 split.
+    assert abs(prd_ref[0] - prd_ref[1]) > 1e-12 * BOX
+    np.testing.assert_allclose(prd_got, prd_ref, rtol=1e-9)
+
+
+@pytestmark_lmp
+def test_wiggle_matches_lammps(tmp_path):
+    """`wiggle` oscillates a box length about its starting value."""
+    cfg = _config(seed=59)
+    amplitude = 0.02 * BOX
+    period = 30 * DT
+    deform = (
+        f"fix 2 all deform/pressure 1 x wiggle {amplitude} {period} units box"
+    )
+    prd_ref = _lammps_box(tmp_path / "lmp", cfg, deform, STEPS)
+
+    prd_got = _run_taichimps(
+        *cfg,
+        axes={"x": {"style": "wiggle", "amplitude": amplitude, "tperiod": period}},
+        couple="none",
+        steps=STEPS,
+    )
+
+    expected = BOX + amplitude * np.sin(2.0 * np.pi * STEPS * DT / period)
+    np.testing.assert_allclose(prd_ref[0], expected, rtol=1e-9)
+    np.testing.assert_allclose(prd_got, prd_ref, rtol=1e-9)

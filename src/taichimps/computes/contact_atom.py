@@ -25,13 +25,11 @@ class ComputeContactAtom:
         radius: ti.template(),
         num_neigh: ti.template(),
         neighbors: ti.template(),
-        prd_f: ti.template(),
-        periodicity_f: ti.template(),
+        domain: ti.template(),
     ):
-        # Zero-dimensional fields rather than Python vectors, so the current
-        # box is read at launch instead of being baked in at compile time.
-        prd = prd_f[None]
-        periodicity = periodicity_f[None]
+        # Delegate the minimum image to Domain so a tilted cell is handled the
+        # same way here as in the pair styles; the hand-rolled per-axis version
+        # this replaced had no tilt corrections at all.
         for i in range(nlocal):
             xi = x[i]
             ri = radius[i]
@@ -41,16 +39,8 @@ class ComputeContactAtom:
                 j = neighbors[i, k]
                 xj = x[j]
                 rj = radius[j]
-                dx = xi[0] - xj[0]
-                dy = xi[1] - xj[1]
-                dz = xi[2] - xj[2]
-                if periodicity[0] and ti.abs(dx) > 0.5 * prd[0]:
-                    dx -= ti.math.sign(dx) * prd[0]
-                if periodicity[1] and ti.abs(dy) > 0.5 * prd[1]:
-                    dy -= ti.math.sign(dy) * prd[1]
-                if periodicity[2] and ti.abs(dz) > 0.5 * prd[2]:
-                    dz -= ti.math.sign(dz) * prd[2]
-                rsq = dx * dx + dy * dy + dz * dz
+                d = domain.minimum_image(xi - xj)
+                rsq = d.dot(d)
                 radsum = ri + rj
                 if rsq < radsum * radsum and rsq > 1e-18:
                     cnt += 1
@@ -65,7 +55,6 @@ class ComputeContactAtom:
             atom.radius,
             neighbor.num_neighbors,
             neighbor.neighbors,
-            domain.prd_f,
-            domain.periodicity_f,
+            domain,
         )
         return self.contact_count.to_numpy()[:atom.nlocal]

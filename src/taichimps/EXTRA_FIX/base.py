@@ -21,6 +21,11 @@ class Fix(ABC):
         # LAMMPS clears this while update->setupflag is set, so the setup force
         # evaluation does not advance any contact history a fix may hold.
         self.history_update = True
+        # Set by a fix that changed the box in a way the neighbor list cannot
+        # tolerate until atoms are remapped -- a triclinic box flip. Simulation
+        # clears it once it has rebuilt. LAMMPS calls the same thing
+        # `next_reneighbor`.
+        self.force_reneighbor = False
 
     def setup(self, nsteps_total: int = 0) -> None:
         """

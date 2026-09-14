@@ -47,6 +47,11 @@ class LAMMPSInputParser:
         self.script_path = Path(script_path)
         self.workdir = self.script_path.parent
         self.variables: dict[str, Any] = {}
+        # Expressions of equal-style variables, kept so they can be
+        # re-evaluated on demand. LAMMPS re-evaluates an equal-style variable
+        # every time it is referenced; storing only the value frozen at
+        # definition time makes any time-dependent variable a constant.
+        self.variable_exprs: dict[str, str] = {}
         self.commands: list[str] = []
         self.default_fp = default_fp
         self.arch = arch
@@ -175,25 +180,55 @@ class LAMMPSInputParser:
         },
     }
 
-    # Number of values each deform style takes after the style name.
+    # Number of values each deform style takes after the style name, for a box
+    # dimension and for a tilt factor respectively.
     _DEFORM_NARG: ClassVar[dict[str, int]] = {
-        "final": 2,
-        "delta": 2,
-        "scale": 1,
-        "vel": 1,
-        "erate": 1,
-        "trate": 1,
-        "volume": 0,
-        "pressure": 2,
-        "pressure/mean": 2,
+        "final": 2, "delta": 2, "scale": 1, "vel": 1, "erate": 1, "trate": 1,
+        "volume": 0, "wiggle": 2, "variable": 2, "pressure": 2, "pressure/mean": 2,
     }
+    _DEFORM_TILT_NARG: ClassVar[dict[str, int]] = {
+        "final": 1, "delta": 1, "vel": 1, "erate": 1, "trate": 1,
+        "wiggle": 2, "variable": 2, "pressure": 2,
+    }
+
+    def _deform_spec(self, style: str, vals: list[str], tilt: bool) -> dict[str, Any]:
+        """Turn a deform style and its raw arguments into an AxisSet keyword dict."""
+        spec: dict[str, Any] = {"style": style}
+        if style == "variable":
+            # Two equal-style variable names, for the change and for its rate.
+            spec["hstr"] = vals[0].removeprefix("v_")
+            spec["hratestr"] = vals[1].removeprefix("v_")
+            return spec
+
+        nums = [float(self.evaluate_expression(v)) for v in vals]
+        if style == "final":
+            if tilt:
+                spec["ftilt"] = nums[0]
+            else:
+                spec["flo"], spec["fhi"] = nums
+        elif style == "delta":
+            if tilt:
+                spec["dtilt"] = nums[0]
+            else:
+                spec["dlo"], spec["dhi"] = nums
+        elif style == "scale":
+            spec["scale"] = nums[0]
+        elif style == "vel":
+            spec["vel"] = nums[0]
+        elif style in ("erate", "trate"):
+            spec["rate"] = nums[0]
+        elif style == "wiggle":
+            spec["amplitude"], spec["tperiod"] = nums
+        elif style in ("pressure", "pressure/mean"):
+            spec["ptarget"], spec["pgain"] = nums
+        return spec
 
     def _parse_deform(self, args: list[str]) -> FixDeformPressure:
         """
         Parse `deform[/pressure] N <dim> <style> <values...> ... [keywords]`.
 
-        Mirrors the FixDeform / FixDeformPressure argument grammar for the
-        subset taichimps can express (no tilt factors, no `box` scaling).
+        Mirrors the FixDeform / FixDeformPressure argument grammar, including
+        the tilt factors and the `box` layer.
         """
         if self.domain is None:
             raise ValueError("fix deform before the simulation box was defined")
@@ -202,42 +237,42 @@ class LAMMPSInputParser:
 
         nevery = int(float(self.evaluate_expression(args[0])))
         axes: dict[str, dict[str, Any]] = {}
+        box: dict[str, Any] | None = None
         couple = "none"
         max_rate = 0.0
         normalize_pressure = False
+        vol_balance_p = False
         remap = "x"
+        flip = True
 
         i = 1
         while i < len(args):
             token = args[i]
-            if token in ("x", "y", "z"):
+            if token in ("x", "y", "z", "xy", "xz", "yz"):
+                tilt = token in ("xy", "xz", "yz")
+                table = self._DEFORM_TILT_NARG if tilt else self._DEFORM_NARG
                 style = args[i + 1]
-                if style not in self._DEFORM_NARG:
-                    raise ValueError(f"Unsupported fix deform style {style!r}")
-                n = self._DEFORM_NARG[style]
-                vals = [
-                    float(self.evaluate_expression(v)) for v in args[i + 2 : i + 2 + n]
-                ]
-                spec: dict[str, Any] = {"style": style}
-                if style == "final":
-                    spec["flo"], spec["fhi"] = vals
-                elif style == "delta":
-                    spec["dlo"], spec["dhi"] = vals
-                elif style == "scale":
-                    spec["scale"] = vals[0]
-                elif style == "vel":
-                    spec["vel"] = vals[0]
-                elif style in ("erate", "trate"):
-                    spec["rate"] = vals[0]
-                elif style in ("pressure", "pressure/mean"):
-                    spec["ptarget"], spec["pgain"] = vals
-                axes[token] = spec
+                if style not in table:
+                    raise ValueError(
+                        f"Unsupported fix deform style {style!r} for {token}"
+                    )
+                n = table[style]
+                axes[token] = self._deform_spec(style, args[i + 2 : i + 2 + n], tilt)
                 i += 2 + n
-            elif token in ("xy", "xz", "yz"):
-                raise ValueError(
-                    "fix deform tilt control needs a triclinic box, which "
-                    "taichimps does not support"
-                )
+            elif token == "box":
+                style = args[i + 1]
+                if style == "volume":
+                    box = {"style": "volume"}
+                    i += 2
+                elif style == "pressure":
+                    box = {
+                        "style": "pressure",
+                        "ptarget": float(self.evaluate_expression(args[i + 2])),
+                        "pgain": float(self.evaluate_expression(args[i + 3])),
+                    }
+                    i += 4
+                else:
+                    raise ValueError(f"Unsupported fix deform box style {style!r}")
             elif token == "couple":
                 couple = args[i + 1]
                 i += 2
@@ -247,13 +282,22 @@ class LAMMPSInputParser:
             elif token == "normalize/pressure":
                 normalize_pressure = args[i + 1].lower() == "yes"
                 i += 2
+            elif token == "vol/balance/p":
+                vol_balance_p = args[i + 1].lower() == "yes"
+                i += 2
             elif token == "remap":
                 remap = args[i + 1]
                 i += 2
+            elif token == "flip":
+                flip = args[i + 1].lower() == "yes"
+                i += 2
             elif token == "units":
                 # Only `box` units are meaningful without a lattice command.
-                i += 2
-            elif token == "flip":
+                if args[i + 1].lower() != "box":
+                    raise ValueError(
+                        "fix deform units lattice needs a lattice command, which "
+                        "taichimps does not have"
+                    )
                 i += 2
             else:
                 raise ValueError(f"Unsupported fix deform keyword: {token!r}")
@@ -261,11 +305,15 @@ class LAMMPSInputParser:
         return FixDeformPressure(
             domain=self.domain,
             axes=axes,
+            box=box,
             couple=couple,
             max_rate=max_rate,
             normalize_pressure=normalize_pressure,
+            vol_balance_p=vol_balance_p,
             remap=remap,
             nevery=nevery,
+            flip=flip,
+            var_eval=self.evaluate_variable,
         )
 
     def _parse_pair_coeff_granular(self, args: list[str]) -> PairGranular:
@@ -361,6 +409,26 @@ class LAMMPSInputParser:
             limit_damping = True
 
         return kn, kt, gamman, gammat, xmu, dampflag, limit_damping
+
+    def evaluate_variable(self, name: str) -> float:
+        """
+        Current value of a variable, re-evaluating an equal-style expression.
+
+        `fix deform ... variable` needs the value as of this timestep, not as of
+        the line that defined it.
+        """
+        name = name.removeprefix("v_")
+        if name in self.variable_exprs:
+            self.update_dynamic_variables()
+            value = self.evaluate_expression(self.variable_exprs[name])
+            if isinstance(value, str):
+                raise ValueError(
+                    f"variable {name!r} did not evaluate to a number: {value!r}"
+                )
+            self.variables[name] = value
+            return float(value)
+        stored = self.variables.get(name, 0.0)
+        return float(stored) if isinstance(stored, (int, float)) else 0.0
 
     def evaluate_expression(self, expr_str: str) -> float | str:
         """Evaluate a mathematical expression or resolve variables."""
@@ -468,8 +536,8 @@ class LAMMPSInputParser:
                 var_style = args[1]
                 if var_style == "equal":
                     expr = "".join(args[2:])
-                    val = self.evaluate_expression(expr)
-                    self.variables[var_name] = val
+                    self.variable_exprs[var_name] = expr
+                    self.variables[var_name] = self.evaluate_expression(expr)
                 elif var_style == "string":
                     self.variables[var_name] = args[2]
                 else:
@@ -514,7 +582,9 @@ class LAMMPSInputParser:
             elif cmd == "read_data":
                 data_file = self.workdir / args[0]
                 data = read_data(data_file)
-                self.domain = Domain(boxlo=data.boxlo, boxhi=data.boxhi)
+                self.domain = Domain(
+                    boxlo=data.boxlo, boxhi=data.boxhi, tilt=data.tilt
+                )
                 self.atom = AtomSystem(max_atoms=data.natoms + 1000)
                 self.atom.add_particles(
                     x=data.x,
@@ -532,8 +602,10 @@ class LAMMPSInputParser:
                 if reg_id in self.regions:
                     reg_data = self.regions[reg_id]
                     if isinstance(reg_data, tuple):
-                        b_lo, b_hi = reg_data
-                        self.domain = Domain(b_lo, b_hi)
+                        # A `prism` region carries tilt factors as a third entry.
+                        b_lo, b_hi = reg_data[0], reg_data[1]
+                        b_tilt = reg_data[2] if len(reg_data) > 2 else None
+                        self.domain = Domain(b_lo, b_hi, tilt=b_tilt)
                         self.atom = AtomSystem(max_atoms=100000, float_type=self.default_fp or ti.f64)
                         # Add a default particle at box center
                         self.atom.add_particles(
@@ -567,7 +639,19 @@ class LAMMPSInputParser:
                 # region <id> cylinder <dim> <c1> <c2> <radius> <lo> <hi> [side in|out]
                 reg_id = args[0]
                 style = args[1]
-                if style == "block" and len(args) >= 8:
+                if style == "prism" and len(args) >= 11:
+                    bounds = [
+                        float(self.evaluate_expression(args[2 + k])) for k in range(6)
+                    ]
+                    prism_tilt = [
+                        float(self.evaluate_expression(args[8 + k])) for k in range(3)
+                    ]
+                    self.regions[reg_id] = (
+                        [bounds[0], bounds[2], bounds[4]],
+                        [bounds[1], bounds[3], bounds[5]],
+                        prism_tilt,
+                    )
+                elif style == "block" and len(args) >= 8:
                     xlo = float(self.evaluate_expression(args[2]))
                     xhi = float(self.evaluate_expression(args[3]))
                     ylo = float(self.evaluate_expression(args[4]))
