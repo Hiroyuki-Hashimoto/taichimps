@@ -2,6 +2,22 @@
 LAMMPS fix wall/gran/region cylinder implementation in Taichi.
 Reference: LAMMPS src/GRANULAR/fix_wall_gran_region.cpp, region_cylinder.cpp
 License: GPL v2 / taichimps MIT reimplementation
+
+The wall is a contact partner of zero radius and infinite mass, exactly as for
+the plane wall: Reff = radi, meff = rmass[i], contact radius a = sqrt(delta*radi)
+and the moment arm is the full particle radius.
+
+This used to have no shear history -- a viscous tangential dashpot with a
+Coulomb cap, i.e. the history-free `hooke`/`hertz` styles -- so a specimen
+resting against a cylindrical wall had no frictional memory at the boundary.
+`history=True` (the default, and what the `*/history` style names select) keeps
+a shear displacement per particle.
+
+Limitation: LAMMPS lets one particle touch several surfaces of a region at once
+and keeps a history entry per surface (history_many[i][iwall]). Only the
+cylinder's curved side is treated here, so there is one history slot per
+particle. `axis_lo`/`axis_hi` bound which particles are considered; they are not
+end-cap walls.
 """
 
 from typing import Any, Literal
@@ -42,13 +58,16 @@ class FixWallGranRegion(Fix):
         fstyle: str = "hooke",
         kn: float = 1e5,
         gamman: float = 0.0,
-        kt: float = 0.0,
-        gammat: float = 0.0,
+        kt: float | None = None,
+        gammat: float | None = None,
         xmu: float = 0.0,
         dampflag: int = 1,
+        history: bool | None = None,
+        limit_damping: bool = False,
+        max_atoms: int = 100000,
         float_type: Any = ti.f64,
     ) -> None:
-        super().__init__(domain)
+        super().__init__(domain, float_type=float_type)
         if isinstance(axis, str):
             axis = {"x": 0, "y": 1, "z": 2}[axis.lower()]
         self.axis = int(axis)
@@ -73,10 +92,22 @@ class FixWallGranRegion(Fix):
         self.kn = float(kn)
         self.gamman = float(gamman)
         self.kt = float(kt) if kt is not None else (2.0 / 7.0 * self.kn)
-        self.gammat = float(gammat) if gammat is not None else (0.5 * self.gamman)
-        self.xmu = float(xmu)
         self.dampflag = int(dampflag)
+        # LAMMPS: "if (dampflag == 0) gammat = 0.0". Damping is always scaled by
+        # the effective mass; dampflag only excludes the tangential term.
+        gammat_val = float(gammat) if gammat is not None else (0.5 * self.gamman)
+        self.gammat = 0.0 if self.dampflag == 0 else gammat_val
+        self.xmu = float(xmu)
+        self.limit_damping = 1 if limit_damping else 0
+        # The style name decides unless the caller overrides it explicitly.
+        self.use_history = (
+            1 if (self.fstyle.endswith("history") if history is None else history) else 0
+        )
         self.float_type = float_type
+
+        # One history slot per particle: the cylinder side is a single surface.
+        self.shear = ti.Vector.field(3, dtype=float_type, shape=max_atoms)
+        self.touch = ti.field(dtype=ti.i32, shape=max_atoms)
 
     @ti.kernel
     def post_force_kernel(
@@ -92,6 +123,7 @@ class FixWallGranRegion(Fix):
         axis_lo: ti.template(),
         axis_hi: ti.template(),
         is_hertz: ti.i32,
+        history_update: ti.i32,
         x: ti.template(),
         v: ti.template(),
         f: ti.template(),
@@ -106,6 +138,9 @@ class FixWallGranRegion(Fix):
 
             pos_axis = pos[axis]
             if has_axis_bounds == 1 and (pos_axis < axis_lo or pos_axis > axis_hi):
+                if ti.static(self.use_history == 1):
+                    self.touch[i] = 0
+                    self.shear[i] = ti.Vector([0.0, 0.0, 0.0])
                 continue
 
             # Determine coordinates in the cross-section plane
@@ -169,55 +204,77 @@ class FixWallGranRegion(Fix):
                     vi = v[i]
                     oi = omega[i]
 
-                    # Relative velocity at contact point
-                    # Contact point on particle relative to center is -r_i * n_wall
-                    # Surface velocity of particle: vi + oi x (-r_i * n_wall) = vi - r_i * (oi x n_wall)
-                    # Wall is stationary: v_wall = 0
+                    # Relative velocity at the contact point. The wall is
+                    # stationary and has zero radius, so W = radi * omega_i;
+                    # (omega x n) is perpendicular to n, so vn is unaffected by
+                    # subtracting it here and vrt comes out as vt - W x n.
                     vr = vi - r_i * oi.cross(n_wall)
                     vn = vr.dot(n_wall)
-                    vrn = vn * n_wall
-                    vrt = vr - vrn
+                    vrt = vr - vn * n_wall
+                    vrel = vrt.norm()
 
-                    # Normal force computation (Hooke vs Hertz)
-                    fn = 0.0
-                    fn_elastic = 0.0
+                    # Contact radius for the Hertz variants: a = sqrt(delta*Reff)
+                    # with Reff = radi, since the wall has zero curvature here.
+                    poly = 1.0
                     if is_hertz == 1:
-                        polyhertz = ti.sqrt(r_i * delta)
-                        fn_elastic = self.kn * delta * polyhertz
-                        fn_damp = self.gamman * vn * polyhertz
-                        if self.dampflag == 1:
-                            fn_damp *= mi
-                        fn = fn_elastic - fn_damp
+                        poly = ti.sqrt(r_i * delta)
+
+                    fn_elastic = self.kn * delta * poly
+                    # hooke -> mass_velocity damping, hertz -> viscoelastic,
+                    # which carries the extra contact-radius factor.
+                    damp_prefactor = mi * self.gamman * poly
+                    fntot = fn_elastic - damp_prefactor * vn
+                    if ti.static(self.limit_damping == 1):
+                        fntot = ti.max(fntot, 0.0)
+                    # LAMMPS bounds friction by the TOTAL normal force.
+                    fscrit = self.xmu * ti.abs(fntot)
+
+                    damp_t = mi * self.gammat * poly
+                    ft_vec = ti.Vector([0.0, 0.0, 0.0])
+
+                    if ti.static(self.use_history == 1):
+                        hist = self.shear[i]
+                        if self.touch[i] == 0:
+                            hist = ti.Vector([0.0, 0.0, 0.0])
+                            self.touch[i] = 1
+
+                        # linear_history_classic: accumulate, take |history|,
+                        # then project back into the tangent plane.
+                        if history_update != 0:
+                            hist = hist + vrt * dt
+                        shrmag = hist.norm()
+                        if history_update != 0:
+                            hist = hist - hist.dot(n_wall) * n_wall
+
+                        fdamp = -damp_t * vrt
+                        ft_vec = -self.kt * poly * hist + fdamp
+
+                        magfs = ft_vec.norm()
+                        if magfs > fscrit:
+                            if shrmag != 0.0:
+                                ft_vec = ft_vec * (fscrit / magfs)
+                                hist = -(ft_vec - fdamp) / (self.kt * poly)
+                            else:
+                                ft_vec = ti.Vector([0.0, 0.0, 0.0])
+                        self.shear[i] = hist
                     else:
-                        fn_elastic = self.kn * delta
-                        fn_damp = self.gamman * vn
-                        if self.dampflag == 1:
-                            fn_damp *= mi
-                        fn = fn_elastic - fn_damp
+                        ft = 0.0
+                        if vrel != 0.0:
+                            ft = ti.min(fscrit, damp_t * vrel) / vrel
+                        ft_vec = -ft * vrt
 
-                    fn = max(fn, 0.0)
-
-                    # Tangential force computation
-                    ft_damp = self.gammat * vrt
-                    if is_hertz == 1:
-                        polyhertz = ti.sqrt(r_i * delta)
-                        ft_damp *= polyhertz
-                    if self.dampflag == 1:
-                        ft_damp *= mi
-
-                    ft_vec = -ft_damp
-                    ft_mag = ft_vec.norm()
-                    ft_max = self.xmu * fn_elastic
-
-                    if ft_mag > ft_max and ft_mag > 1e-16:
-                        ft_vec *= ft_max / ft_mag
-
-                    f_total = fn * n_wall + ft_vec
-                    f[i] += f_total
-
-                    # Torque on particle:
-                    # Torque = r_c x F = (-r_i * n_wall) x ft_vec = -r_i * (n_wall x ft_vec)
+                    f[i] += fntot * n_wall + ft_vec
+                    # For a wall the moment arm is the full radius.
                     torque[i] += -r_i * n_wall.cross(ft_vec)
+                else:
+                    if ti.static(self.use_history == 1):
+                        self.touch[i] = 0
+                        self.shear[i] = ti.Vector([0.0, 0.0, 0.0])
+            else:
+                # On the cylinder axis: no well-defined normal, no contact.
+                if ti.static(self.use_history == 1):
+                    self.touch[i] = 0
+                    self.shear[i] = ti.Vector([0.0, 0.0, 0.0])
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
@@ -234,6 +291,7 @@ class FixWallGranRegion(Fix):
             self.axis_lo,
             self.axis_hi,
             self.is_hertz,
+            1 if self.history_update else 0,
             atom.x,
             atom.v,
             atom.f,

@@ -1204,9 +1204,12 @@ class LAMMPSInputParser:
                                 kn=kn,
                                 gamman=gamman,
                                 kt=kt if kt is not None else 0.0,
-                                gammat=gammat if gammat is not None else 0.0,
+                                gammat=gammat,
                                 xmu=xmu,
                                 dampflag=dampflag,
+                                max_atoms=(
+                                    self.atom.max_atoms if self.atom else 100000
+                                ),
                             )
                         else:
                             # Default fallback or planar region
@@ -1233,10 +1236,13 @@ class LAMMPSInputParser:
                             fstyle=fstyle,
                             kn=kn,
                             gamman=gamman,
-                            kt=kt if kt is not None else 0.0,
-                            gammat=gammat if gammat is not None else 0.0,
+                            kt=kt,
+                            gammat=gammat,
                             xmu=xmu,
                             dampflag=dampflag,
+                            max_atoms=(
+                                self.atom.max_atoms if self.atom else 100000
+                            ),
                         )
                     else:
                         # Plane wall(s). LAMMPS takes `<dim>plane lo hi`, either

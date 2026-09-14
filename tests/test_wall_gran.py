@@ -25,6 +25,7 @@ from taichimps.atom import AtomSystem
 from taichimps.domain import Domain
 from taichimps.EXTRA_FIX.nve_sphere import FixNVESphere
 from taichimps.EXTRA_FIX.wall_gran import FixWallGran
+from taichimps.EXTRA_FIX.wall_gran_region import FixWallGranRegion
 from taichimps.neighbor import NeighborList
 from taichimps.simulation import Simulation
 
@@ -163,5 +164,120 @@ def test_wall_hooke_nohistory_matches_lammps(tmp_path):
     cfg = _config(seed=9)
     ref = _run_lammps(tmp_path / "lmp_nh", cfg, 20, "hooke")
     f_got, tq_got = _run_taichimps(cfg, 20, history=False)
+    _assert_close(f_got, force_array(ref), "force")
+    _assert_close(tq_got, torque_array(ref), "torque")
+
+
+# --------------------------------------------------------------------------
+# Cylindrical region wall
+# --------------------------------------------------------------------------
+
+CYL_R = 0.008
+CYL_C = (BOX / 2, BOX / 2)
+
+
+def _cyl_config(seed: int = 11, n: int = 6):
+    """Particles pressed against the inside of a z-cylinder, sliding and spinning."""
+    rng = np.random.default_rng(seed)
+    theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    # Overlap the wall by 2-20% of the radius.
+    rad_pos = CYL_R - RADIUS * rng.uniform(0.80, 0.98, size=n)
+    x = np.stack(
+        [
+            CYL_C[0] + rad_pos * np.cos(theta),
+            CYL_C[1] + rad_pos * np.sin(theta),
+            np.full(n, BOX / 2),
+        ],
+        axis=1,
+    )
+    v = rng.normal(scale=0.05, size=(n, 3))
+    # Push each one outward, into the wall.
+    v[:, 0] += 0.05 * np.cos(theta)
+    v[:, 1] += 0.05 * np.sin(theta)
+    omega = rng.normal(scale=30.0, size=(n, 3))
+
+    # The particles must not touch each other: the test is about the wall, and
+    # LAMMPS has a pair style active whose forces would otherwise mix in.
+    sep = np.linalg.norm(x[:, None, :] - x[None, :, :], axis=-1)
+    np.fill_diagonal(sep, np.inf)
+    assert sep.min() > 2.0 * RADIUS + 0.0005, (
+        f"particles are {sep.min():.5f} apart, closer than 2R + skin"
+    )
+    return x, np.full(n, RADIUS), np.full(n, DENSITY), v, omega
+
+
+def _run_taichimps_cyl(cfg, steps, style):
+    x, radius, density, v, omega = cfg
+    domain = Domain(
+        boxlo=[0.0, 0.0, 0.0], boxhi=[BOX, BOX, BOX], boundary=("f", "f", "p")
+    )
+    n = len(x)
+    atom = AtomSystem(max_atoms=n)
+    atom.add_particles(x=x, radius=radius, density=density, v=v, omega=omega)
+    neighbor = NeighborList(domain=domain, max_atoms=n, max_neighbors_per_atom=32,
+                            skin=0.0005)
+    neighbor.check = False
+    neighbor.every = 1
+    sim = Simulation(domain=domain, atom=atom, neighbor=neighbor, pair=None, dt=DT)
+    sim.add_fix(FixNVESphere(domain=domain))
+    sim.add_fix(
+        FixWallGranRegion(
+            domain=domain,
+            axis=2,
+            c1=CYL_C[0],
+            c2=CYL_C[1],
+            radius=CYL_R,
+            side="in",
+            fstyle=style,
+            kn=KN,
+            gamman=GAMMAN,
+            kt=KT,
+            gammat=GAMMAT,
+            xmu=XMU,
+            max_atoms=n,
+        )
+    )
+    if steps == 0:
+        sim.init_simulation()
+    else:
+        sim.run(steps)
+    return atom.f.to_numpy()[:n].copy(), atom.torque.to_numpy()[:n].copy()
+
+
+@pytest.mark.parametrize("style", ["hooke", "hooke/history"])
+def test_cylinder_region_wall_matches_lammps(tmp_path, style):
+    """
+    `fix wall/gran zcylinder`, with and without shear history.
+
+    The region wall had no history at all before this, and bounded friction by
+    the elastic part of the normal force rather than the total.
+    """
+    cfg = _cyl_config()
+    x, radius, density, v, omega = cfg
+    frames = run_lammps(
+        tmp_path / f"lmp_{style.replace('/', '_')}",
+        x=x,
+        radius=radius,
+        density=density,
+        v=v,
+        omega=omega,
+        boxlo=(0.0, 0.0, 0.0),
+        boxhi=(BOX, BOX, BOX),
+        pair_style=f"gran/hooke {KN} {KT} {GAMMAN} {GAMMAT} {XMU} 1",
+        steps=20,
+        dt=DT,
+        skin=0.0005,
+        boundary="f f p",
+        # The zcylinder keyword was removed from fix wall/gran; a cylindrical
+        # wall is a region wall now.
+        extra_fixes=(
+            f"region cyl cylinder z {CYL_C[0]} {CYL_C[1]} {CYL_R} 0.0 {BOX} side in\n"
+            f"fix w all wall/gran/region {style} {KN} {KT} {GAMMAN} {GAMMAT} {XMU} 1 "
+            f"region cyl"
+        ),
+    )
+    ref = frames[-1]
+
+    f_got, tq_got = _run_taichimps_cyl(cfg, 20, style)
     _assert_close(f_got, force_array(ref), "force")
     _assert_close(tq_got, torque_array(ref), "torque")
