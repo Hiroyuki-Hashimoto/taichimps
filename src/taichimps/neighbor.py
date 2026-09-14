@@ -75,20 +75,48 @@ class NeighborList:
         self.grid_head = ti.field(dtype=ti.i32, shape=self.max_grid_cells)
         self.grid_next = ti.field(dtype=ti.i32, shape=max_atoms)
 
+    def perpendicular_widths(self) -> list[float]:
+        """
+        Distance between the opposite faces of the cell, per lattice direction.
+
+        For a cell spanned by a, b, c the spacing of the planes normal to the
+        (b, c) face is V / |b x c|, and so on.  For an orthogonal box this is
+        just prd.  Bins have to be at least a cutoff wide measured this way, not
+        along the (longer) lattice vectors.
+        """
+        xprd, yprd, zprd = (float(v) for v in self.domain.prd)
+        xy, xz, yz = (float(v) for v in self.domain.tilt)
+        a = np.array([xprd, 0.0, 0.0])
+        b = np.array([xy, yprd, 0.0])
+        c = np.array([xz, yz, zprd])
+        vol = xprd * yprd * zprd
+        return [
+            vol / np.linalg.norm(np.cross(b, c)),
+            vol / np.linalg.norm(np.cross(c, a)),
+            vol / np.linalg.norm(np.cross(a, b)),
+        ]
+
     def setup_grid(self, max_cutoff: float) -> None:
-        """Setup grid dimensions given maximum cutoff distance (2 * r_max + skin)."""
+        """
+        Setup grid dimensions given maximum cutoff distance (2 * r_max + skin).
+
+        Bins are laid out in lamda (fractional) coordinates, where the cell is
+        always the unit cube regardless of tilt.  That is what makes wrapping a
+        bin index across a periodic boundary a plain modulo: in Cartesian bins,
+        stepping one period along z of a tilted box also shifts x by xz, so the
+        index arithmetic would be wrong.  LAMMPS avoids the problem differently,
+        by binning the Cartesian bounding box and relying on ghost atoms, which
+        taichimps does not have.  For an orthogonal box lamda bins and Cartesian
+        bins coincide.
+        """
         cut = max_cutoff + self.skin
         if cut <= 0:
             cut = 1.0
 
-        prd = [
-            float(self.domain.prd[0]),
-            float(self.domain.prd[1]),
-            float(self.domain.prd[2]),
-        ]
-        gx = max(1, int(np.floor(prd[0] / cut)))
-        gy = max(1, int(np.floor(prd[1] / cut)))
-        gz = max(1, int(np.floor(prd[2] / cut)))
+        widths = self.perpendicular_widths()
+        gx = max(1, int(np.floor(widths[0] / cut)))
+        gy = max(1, int(np.floor(widths[1] / cut)))
+        gz = max(1, int(np.floor(widths[2] / cut)))
 
         # A periodic dimension binned into exactly 2 cells is degenerate: the
         # -1 and +1 stencil offsets wrap onto the same cell, so every candidate
@@ -111,21 +139,21 @@ class NeighborList:
             gz = max(1, int(gz * factor))
 
         self.grid_dim[None] = ti.Vector([gx, gy, gz])
+        # Bin size in lamda units; the unit cube is divided into gx*gy*gz bins.
         self.cell_size[None] = ti.Vector(
-            [prd[0] / gx, prd[1] / gy, prd[2] / gz], dt=self.float_type
+            [1.0 / gx, 1.0 / gy, 1.0 / gz], dt=self.float_type
         )
 
     @ti.func
     def get_cell_coord(self, pos):
         gdim = self.grid_dim[None]
         csize = self.cell_size[None]
-        # Read boxlo from the device field, not the host mirror: the host value
-        # would be baked into the kernel at compile time and go stale as soon
-        # as the box deforms.
-        lo = self.domain.boxlo_f[None]
-        cx = ti.cast(ti.floor((pos[0] - lo[0]) / csize[0]), ti.i32)
-        cy = ti.cast(ti.floor((pos[1] - lo[1]) / csize[1]), ti.i32)
-        cz = ti.cast(ti.floor((pos[2] - lo[2]) / csize[2]), ti.i32)
+        # Bin in lamda coordinates. Domain reads the box from device fields, so
+        # this follows a deforming box instead of the step-zero one.
+        lamda = self.domain.lamda_of(pos)
+        cx = ti.cast(ti.floor(lamda[0] / csize[0]), ti.i32)
+        cy = ti.cast(ti.floor(lamda[1] / csize[1]), ti.i32)
+        cz = ti.cast(ti.floor(lamda[2] / csize[2]), ti.i32)
 
         # Clamp inside grid boundaries
         cx = ti.max(0, ti.min(cx, gdim[0] - 1))

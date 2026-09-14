@@ -49,6 +49,7 @@ def write_data_file(
     omega: np.ndarray,
     boxlo: tuple[float, float, float],
     boxhi: tuple[float, float, float],
+    tilt: tuple[float, float, float] | None = None,
 ) -> None:
     """Write an `atom_style sphere` data file (diameter + density, as LAMMPS wants)."""
     n = len(x)
@@ -61,6 +62,11 @@ def write_data_file(
         f"{boxlo[0]:.17g} {boxhi[0]:.17g} xlo xhi",
         f"{boxlo[1]:.17g} {boxhi[1]:.17g} ylo yhi",
         f"{boxlo[2]:.17g} {boxhi[2]:.17g} zlo zhi",
+    ]
+    if tilt is not None:
+        # A triclinic data file carries the tilt factors right after zlo zhi.
+        lines.append(f"{tilt[0]:.17g} {tilt[1]:.17g} {tilt[2]:.17g} xy xz yz")
+    lines += [
         "",
         "Atoms # sphere",
         "",
@@ -90,6 +96,7 @@ def build_input(
     integrate: bool = True,
     extra_fixes: str = "",
     pre_pair: str = "",
+    box_tilt_large: bool = False,
 ) -> str:
     """
     A minimal granular input.
@@ -112,7 +119,7 @@ boundary {boundary}
 newton off
 dimension 3
 comm_modify mode single vel yes
-
+{"box tilt large" if box_tilt_large else ""}
 read_data data.in
 {pre_pair}
 pair_style {pair_style}
@@ -174,6 +181,8 @@ def run_lammps(
     integrate: bool = True,
     extra_fixes: str = "",
     pre_pair: str = "",
+    tilt: tuple[float, float, float] | None = None,
+    box_tilt_large: bool = False,
 ) -> list[dict[str, np.ndarray]]:
     """Run LAMMPS in `workdir` and return the parsed dump frames."""
     exe = lmp_executable()
@@ -181,11 +190,13 @@ def run_lammps(
         raise RuntimeError("No LAMMPS executable available")
 
     workdir.mkdir(parents=True, exist_ok=True)
-    write_data_file(workdir / "data.in", x, radius, density, v, omega, boxlo, boxhi)
+    write_data_file(
+        workdir / "data.in", x, radius, density, v, omega, boxlo, boxhi, tilt
+    )
     (workdir / "in.parity").write_text(
         build_input(
             pair_style, pair_coeff, steps, dt, skin, boundary, integrate,
-            extra_fixes, pre_pair,
+            extra_fixes, pre_pair, box_tilt_large,
         )
     )
 
@@ -208,7 +219,13 @@ def run_lammps(
 
 
 def parse_box(path: Path) -> list[np.ndarray]:
-    """Per-frame box bounds as a (3, 2) array of [lo, hi] per dimension."""
+    """
+    Per-frame box bounds as a (3, 2) array of [lo, hi] per dimension.
+
+    For a triclinic dump LAMMPS reports the *bounding* box plus a tilt factor on
+    each line; use parse_tilt() for the tilt and box_from_bound() to recover the
+    true bounds.
+    """
     boxes: list[np.ndarray] = []
     lines = path.read_text().splitlines()
     for i, line in enumerate(lines):
@@ -217,6 +234,39 @@ def parse_box(path: Path) -> list[np.ndarray]:
                 np.array([[float(t) for t in lines[i + 1 + d].split()[:2]] for d in range(3)])
             )
     return boxes
+
+
+def parse_tilt(path: Path) -> list[np.ndarray]:
+    """Per-frame [xy, xz, yz], or zeros when the dump is orthogonal."""
+    tilts: list[np.ndarray] = []
+    lines = path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith("ITEM: BOX BOUNDS"):
+            continue
+        if "xy xz yz" in line:
+            tilts.append(
+                np.array([float(lines[i + 1 + d].split()[2]) for d in range(3)])
+            )
+        else:
+            tilts.append(np.zeros(3))
+    return tilts
+
+
+def box_from_bound(bound: np.ndarray, tilt: np.ndarray) -> np.ndarray:
+    """
+    Undo LAMMPS's triclinic dump convention to get the true [lo, hi] per dim.
+
+    Domain::set_global_box():
+      xlo_bound = xlo + min(0, xy, xz, xy+xz), xhi_bound = xhi + max(...)
+      ylo_bound = ylo + min(0, yz),            yhi_bound = yhi + max(0, yz)
+    """
+    xy, xz, yz = (float(v) for v in tilt)
+    box = bound.copy()
+    box[0, 0] -= min(0.0, xy, xz, xy + xz)
+    box[0, 1] -= max(0.0, xy, xz, xy + xz)
+    box[1, 0] -= min(0.0, yz)
+    box[1, 1] -= max(0.0, yz)
+    return box
 
 
 def force_array(frame: dict[str, np.ndarray]) -> np.ndarray:
