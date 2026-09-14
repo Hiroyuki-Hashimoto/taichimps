@@ -88,14 +88,18 @@ def build_input(
     skin: float,
     boundary: str = "p p p",
     integrate: bool = True,
+    extra_fixes: str = "",
 ) -> str:
     """
     A minimal granular input.
 
     `neigh_modify delay 0 every 1 check no` forces a rebuild on every step, so
     that contact history carry-over is exercised rather than bypassed.
+    `extra_fixes` is dropped in verbatim, for things like fix deform/pressure.
     """
     fix_line = "fix 1 all nve/sphere" if integrate else ""
+    if extra_fixes:
+        fix_line = f"{fix_line}\n{extra_fixes}"
     # Even the legacy gran/* styles, whose coefficients are global, still
     # require an explicit pair_coeff line.
     coeff_line = f"pair_coeff {pair_coeff or '* *'}"
@@ -125,7 +129,7 @@ dump 1 all custom 1 dump.out {' '.join(DUMP_FIELDS)}
 dump_modify 1 sort id format float %.17e
 
 thermo 1
-thermo_style custom step c_vir[1] c_vir[2] c_vir[3] c_vir[4] c_vir[5] c_vir[6]
+thermo_style custom step lx ly lz c_vir[1] c_vir[2] c_vir[3]
 
 run {steps}
 """
@@ -167,6 +171,7 @@ def run_lammps(
     skin: float = 0.0,
     boundary: str = "p p p",
     integrate: bool = True,
+    extra_fixes: str = "",
 ) -> list[dict[str, np.ndarray]]:
     """Run LAMMPS in `workdir` and return the parsed dump frames."""
     exe = lmp_executable()
@@ -176,7 +181,9 @@ def run_lammps(
     workdir.mkdir(parents=True, exist_ok=True)
     write_data_file(workdir / "data.in", x, radius, density, v, omega, boxlo, boxhi)
     (workdir / "in.parity").write_text(
-        build_input(pair_style, pair_coeff, steps, dt, skin, boundary, integrate)
+        build_input(
+            pair_style, pair_coeff, steps, dt, skin, boundary, integrate, extra_fixes
+        )
     )
 
     proc = subprocess.run(
@@ -195,6 +202,18 @@ def run_lammps(
             f"stdout:\n{proc.stdout[-2000:]}\nstderr:\n{proc.stderr[-2000:]}\nlog:\n{tail}"
         )
     return parse_dump(workdir / "dump.out")
+
+
+def parse_box(path: Path) -> list[np.ndarray]:
+    """Per-frame box bounds as a (3, 2) array of [lo, hi] per dimension."""
+    boxes: list[np.ndarray] = []
+    lines = path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("ITEM: BOX BOUNDS"):
+            boxes.append(
+                np.array([[float(t) for t in lines[i + 1 + d].split()[:2]] for d in range(3)])
+            )
+    return boxes
 
 
 def force_array(frame: dict[str, np.ndarray]) -> np.ndarray:

@@ -119,9 +119,13 @@ class NeighborList:
     def get_cell_coord(self, pos):
         gdim = self.grid_dim[None]
         csize = self.cell_size[None]
-        cx = ti.cast(ti.floor((pos[0] - self.domain.boxlo[0]) / csize[0]), ti.i32)
-        cy = ti.cast(ti.floor((pos[1] - self.domain.boxlo[1]) / csize[1]), ti.i32)
-        cz = ti.cast(ti.floor((pos[2] - self.domain.boxlo[2]) / csize[2]), ti.i32)
+        # Read boxlo from the device field, not the host mirror: the host value
+        # would be baked into the kernel at compile time and go stale as soon
+        # as the box deforms.
+        lo = self.domain.boxlo_f[None]
+        cx = ti.cast(ti.floor((pos[0] - lo[0]) / csize[0]), ti.i32)
+        cy = ti.cast(ti.floor((pos[1] - lo[1]) / csize[1]), ti.i32)
+        cz = ti.cast(ti.floor((pos[2] - lo[2]) / csize[2]), ti.i32)
 
         # Clamp inside grid boundaries
         cx = ti.max(0, ti.min(cx, gdim[0] - 1))
@@ -174,11 +178,8 @@ class NeighborList:
         gdim = self.grid_dim[None]
         gx, gy, gz = gdim[0], gdim[1], gdim[2]
         gxy = gx * gy
-        px, py, pz = (
-            self.domain.periodicity[0],
-            self.domain.periodicity[1],
-            self.domain.periodicity[2],
-        )
+        per = self.domain.periodicity_f[None]
+        px, py, pz = per[0], per[1], per[2]
 
         for i in range(nlocal):
             self.num_neighbors[i] = 0

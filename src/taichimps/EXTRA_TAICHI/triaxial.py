@@ -17,6 +17,7 @@ import numpy as np
 import taichi as ti
 
 from taichimps.atom import AtomSystem
+from taichimps.computes.thermo import Computes
 from taichimps.domain import Domain
 from taichimps.EXTRA_FIX.base import Fix
 
@@ -42,47 +43,30 @@ class FixTriaxial(Fix):
         self.stress_damping = float(stress_damping)
         self.max_velocity = float(max_velocity)
 
-        # Field for virial stress accumulator
-        self.virial = ti.Matrix.field(3, 3, dtype=float_type, shape=())
+        self.computes = Computes(float_type=float_type)
+        # Scratch for the remap kernel, held as fields so the kernel compiles
+        # once rather than once per distinct box.
+        self._old_lo = ti.Vector.field(3, dtype=float_type, shape=())
+        self._new_lo = ti.Vector.field(3, dtype=float_type, shape=())
+        self._scale = ti.Vector.field(3, dtype=float_type, shape=())
         self.current_stress = np.zeros(3, dtype=np.float64)
 
     @ti.kernel
-    def compute_virial_stress_kernel(
-        self,
-        nlocal: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        rmass: ti.template(),
-    ):
-        self.virial[None] = ti.Matrix([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
-        for i in range(nlocal):
-            m = rmass[i]
-            # Kinetic part
-            for r in ti.static(range(3)):
-                for c in ti.static(range(3)):
-                    ti.atomic_add(self.virial[None][r, c], m * v[i][r] * v[i][c])
-            # Force part
-            for r in ti.static(range(3)):
-                for c in ti.static(range(3)):
-                    ti.atomic_add(self.virial[None][r, c], x[i][r] * f[i][c])
+    def remap_positions_kernel(self, nlocal: ti.i32, x: ti.template()):
+        """
+        Affine remap onto the new box: x_new = new_lo + (x - old_lo) * scale.
 
-    @ti.kernel
-    def remap_positions_kernel(
-        self,
-        nlocal: ti.i32,
-        x: ti.template(),
-        scale_x: ti.template(),
-        scale_y: ti.template(),
-        scale_z: ti.template(),
-        origin_x: ti.template(),
-        origin_y: ti.template(),
-        origin_z: ti.template(),
-    ):
+        Anchoring on the *new* lower bound is what keeps fractional coordinates
+        fixed. Anchoring on the old one while the box is recentred (which is
+        what this did) leaves every particle displaced by half the box-length
+        change on each update, so the assembly drifts out of the cell.
+        """
+        old_lo = self._old_lo[None]
+        new_lo = self._new_lo[None]
+        scale = self._scale[None]
         for i in range(nlocal):
-            x[i][0] = origin_x + (x[i][0] - origin_x) * scale_x
-            x[i][1] = origin_y + (x[i][1] - origin_y) * scale_y
-            x[i][2] = origin_z + (x[i][2] - origin_z) * scale_z
+            for d in ti.static(range(3)):
+                x[i][d] = new_lo[d] + (x[i][d] - old_lo[d]) * scale[d]
 
     def end_of_step(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0 or self.domain is None:
@@ -92,20 +76,11 @@ class FixTriaxial(Fix):
         if vol <= 0.0:
             return
 
-        # Compute current virial stress
-        self.compute_virial_stress_kernel(
-            atom.nlocal,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.rmass,
-        )
-        vir_np = self.virial.to_numpy()
-        # Cauchy stress sigma_ii = - virial_ii / volume
-        self.current_stress = np.array(
-            [-vir_np[0, 0] / vol, -vir_np[1, 1] / vol, -vir_np[2, 2] / vol],
-            dtype=np.float64,
-        )
+        # Current Cauchy stress, sigma = -P. The pressure comes from the
+        # pairwise virial tallied by the pair styles rather than from
+        # sum(x_i . f_i), which is not translation invariant under PBC.
+        pressure = self.computes.compute_pressure_tensor(atom, self.domain)
+        self.current_stress = -pressure[:3].copy()
 
         lx = self.domain.boxhi[0] - self.domain.boxlo[0]
         ly = self.domain.boxhi[1] - self.domain.boxlo[1]
@@ -143,17 +118,13 @@ class FixTriaxial(Fix):
             self.domain.boxhi[2] + 0.5 * (scale[2] - 1.0) * lz,
         ]
 
-        # Affine position remap
-        self.remap_positions_kernel(
-            atom.nlocal,
-            atom.x,
-            scale[0],
-            scale[1],
-            scale[2],
-            self.domain.boxlo[0],
-            self.domain.boxlo[1],
-            self.domain.boxlo[2],
+        # Affine position remap, anchored on the new lower bound
+        self._old_lo[None] = ti.Vector(
+            [float(self.domain.boxlo[d]) for d in range(3)]
         )
+        self._new_lo[None] = ti.Vector([float(v) for v in new_boxlo])
+        self._scale[None] = ti.Vector([float(s) for s in scale])
+        self.remap_positions_kernel(atom.nlocal, atom.x)
 
         self.domain.set_box(new_boxlo, new_boxhi)
 

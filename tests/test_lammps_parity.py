@@ -69,6 +69,31 @@ def _random_packing(rng, n=60, box=6.0, radius=0.5):
     return pts % box
 
 
+def test_kernels_see_the_current_box_after_it_changes():
+    """
+    Domain must hand the kernels the box as it is now, not as it was.
+
+    boxlo/boxhi/prd used to be ti.Vector objects, i.e. Python values that Taichi
+    bakes into a kernel when it first compiles it. Every deforming-box run --
+    which is every isotropic-compression or triaxial test -- therefore kept
+    computing minimum-image distances against the step-zero box for the whole
+    run. This is the smallest thing that catches a regression of that.
+    """
+    domain = Domain(boxlo=[0.0] * 3, boxhi=[10.0] * 3, boundary=("p", "p", "p"))
+    atom = AtomSystem(max_atoms=1)
+    atom.add_particles(x=[[9.5, 1.0, 1.0]], radius=0.1, density=1000.0)
+
+    # Force the pbc kernel to be compiled against the original box.
+    domain.pbc(atom)
+    np.testing.assert_allclose(atom.x.to_numpy()[0][0], 9.5)
+
+    domain.set_box([0.0] * 3, [4.0, 10.0, 10.0])
+    domain.pbc(atom)
+    # 9.5 wrapped into a box of length 4 is 1.5; against the stale box it would
+    # have been left at 9.5.
+    np.testing.assert_allclose(atom.x.to_numpy()[0][0], 1.5, atol=1e-12)
+
+
 def test_pressure_tensor_is_translation_invariant():
     """
     The virial must not depend on where the box origin sits.

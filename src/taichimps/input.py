@@ -175,6 +175,99 @@ class LAMMPSInputParser:
         },
     }
 
+    # Number of values each deform style takes after the style name.
+    _DEFORM_NARG: ClassVar[dict[str, int]] = {
+        "final": 2,
+        "delta": 2,
+        "scale": 1,
+        "vel": 1,
+        "erate": 1,
+        "trate": 1,
+        "volume": 0,
+        "pressure": 2,
+        "pressure/mean": 2,
+    }
+
+    def _parse_deform(self, args: list[str]) -> FixDeformPressure:
+        """
+        Parse `deform[/pressure] N <dim> <style> <values...> ... [keywords]`.
+
+        Mirrors the FixDeform / FixDeformPressure argument grammar for the
+        subset taichimps can express (no tilt factors, no `box` scaling).
+        """
+        if self.domain is None:
+            raise ValueError("fix deform before the simulation box was defined")
+        if not args:
+            raise ValueError("fix deform needs an N argument")
+
+        nevery = int(float(self.evaluate_expression(args[0])))
+        axes: dict[str, dict[str, Any]] = {}
+        couple = "none"
+        max_rate = 0.0
+        normalize_pressure = False
+        remap = "x"
+
+        i = 1
+        while i < len(args):
+            token = args[i]
+            if token in ("x", "y", "z"):
+                style = args[i + 1]
+                if style not in self._DEFORM_NARG:
+                    raise ValueError(f"Unsupported fix deform style {style!r}")
+                n = self._DEFORM_NARG[style]
+                vals = [
+                    float(self.evaluate_expression(v)) for v in args[i + 2 : i + 2 + n]
+                ]
+                spec: dict[str, Any] = {"style": style}
+                if style == "final":
+                    spec["flo"], spec["fhi"] = vals
+                elif style == "delta":
+                    spec["dlo"], spec["dhi"] = vals
+                elif style == "scale":
+                    spec["scale"] = vals[0]
+                elif style == "vel":
+                    spec["vel"] = vals[0]
+                elif style in ("erate", "trate"):
+                    spec["rate"] = vals[0]
+                elif style in ("pressure", "pressure/mean"):
+                    spec["ptarget"], spec["pgain"] = vals
+                axes[token] = spec
+                i += 2 + n
+            elif token in ("xy", "xz", "yz"):
+                raise ValueError(
+                    "fix deform tilt control needs a triclinic box, which "
+                    "taichimps does not support"
+                )
+            elif token == "couple":
+                couple = args[i + 1]
+                i += 2
+            elif token == "max/rate":
+                max_rate = float(self.evaluate_expression(args[i + 1]))
+                i += 2
+            elif token == "normalize/pressure":
+                normalize_pressure = args[i + 1].lower() == "yes"
+                i += 2
+            elif token == "remap":
+                remap = args[i + 1]
+                i += 2
+            elif token == "units":
+                # Only `box` units are meaningful without a lattice command.
+                i += 2
+            elif token == "flip":
+                i += 2
+            else:
+                raise ValueError(f"Unsupported fix deform keyword: {token!r}")
+
+        return FixDeformPressure(
+            domain=self.domain,
+            axes=axes,
+            couple=couple,
+            max_rate=max_rate,
+            normalize_pressure=normalize_pressure,
+            remap=remap,
+            nevery=nevery,
+        )
+
     def _parse_pair_coeff_granular(self, args: list[str]) -> PairGranular:
         """
         Parse `pair_coeff <i> <j> <normal> <coeffs...> [tangential ...] [damping ...]`.
@@ -611,24 +704,9 @@ class LAMMPSInputParser:
                         if self.simulation:
                             self.simulation.add_fix(fix_inst)
 
-                elif fix_style == "deform/pressure":
-                    # fix <id> <group> deform/pressure <nevery> x pressure <P> <gain> y ...
-                    nevery = int(fix_args[0])
-                    # Parse target pressure from arguments
-                    p_target = 50000.0
-                    p_gain = 0.0001
-                    for idx, a in enumerate(fix_args):
-                        if a == "pressure":
-                            p_target = float(self.evaluate_expression(fix_args[idx + 1]))
-                            p_gain = float(self.evaluate_expression(fix_args[idx + 2]))
-                            break
+                elif fix_style in ("deform/pressure", "deform"):
                     if self.domain:
-                        fix_inst = FixDeformPressure(
-                            domain=self.domain,
-                            p_target=p_target,
-                            p_gain=p_gain,
-                            nevery=nevery,
-                        )
+                        fix_inst = self._parse_deform(fix_args)
                         self.fixes[fix_id] = fix_inst
                         if self.simulation:
                             self.simulation.add_fix(fix_inst)

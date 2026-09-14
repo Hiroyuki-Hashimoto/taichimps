@@ -119,6 +119,13 @@ class Simulation:
             self.history.restore_state(self.atom, self.neighbor)
         return True
 
+    def setup_run(self, nsteps_total: int) -> None:
+        """Tell the fixes a run is starting and how long it is."""
+        for fix in self.fixes:
+            fix.setup(nsteps_total)
+        if self.integrator is not None:
+            self.integrator.setup(nsteps_total)
+
     def init_simulation(self) -> None:
         """Initialize forces for the first timestep if not already done."""
         # Calculate initial forces if needed
@@ -180,6 +187,7 @@ class Simulation:
         """
         if self.timestep == 0:
             self.init_simulation()
+        self.setup_run(steps)
 
         intervals = []
         for _, freq in self.dumps:
@@ -230,5 +238,6 @@ class Simulation:
         """Run the simulation for a given number of steps."""
         if self.timestep == 0:
             self.init_simulation()
+        self.setup_run(steps)
         for _ in range(steps):
             self.step()

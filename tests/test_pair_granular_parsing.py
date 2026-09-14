@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 import taichi as ti
 
-from taichimps.domain import Domain
 from taichimps.GRANULAR.granular import (
     PairGranular,
     mix_stiffness_e,
@@ -26,11 +25,17 @@ POISS = 0.23
 COR = 0.95
 FRIC = 0.3
 
+# The box comes from the script rather than being injected afterwards:
+# LAMMPSInputParser.execute() calls ti.init(), which tears down any Taichi
+# fields allocated before it -- including the ones Domain now holds.
 SCRIPT = f"""
 units           si
 boundary        p p p
 atom_style      sphere
 dimension       3
+
+region          box block 0.0 1.0 0.0 1.0 0.0 1.0
+create_box      1 box
 
 variable        Ep equal {EMOD}
 variable        Poi equal {POISS}
@@ -53,9 +58,6 @@ def test_pair_style_granular_is_parsed(tmp_path):
     script.write_text(SCRIPT)
 
     parser = LAMMPSInputParser(script)
-    parser.domain = Domain(
-        boxlo=[0.0, 0.0, 0.0], boxhi=[1.0, 1.0, 1.0], boundary=("p", "p", "p")
-    )
     parser.execute()
 
     pair = parser.pair_style
@@ -87,10 +89,10 @@ def test_unsupported_submodel_is_rejected(tmp_path):
     script = tmp_path / "in.jkr"
     script.write_text(
         "units si\nboundary p p p\natom_style sphere\n"
+        "region box block 0.0 1.0 0.0 1.0 0.0 1.0\ncreate_box 1 box\n"
         "pair_style granular\n"
         "pair_coeff * * jkr 1e9 0.95 0.23 0.1 tangential mindlin NULL 1.0 0.3\n"
     )
     parser = LAMMPSInputParser(script)
-    parser.domain = Domain(boxlo=[0.0] * 3, boxhi=[1.0] * 3)
     with pytest.raises(ValueError, match="jkr"):
         parser.execute()

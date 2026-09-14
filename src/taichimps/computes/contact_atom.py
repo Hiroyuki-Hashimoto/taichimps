@@ -25,9 +25,13 @@ class ComputeContactAtom:
         radius: ti.template(),
         num_neigh: ti.template(),
         neighbors: ti.template(),
-        prd: ti.template(),
-        periodicity: ti.template(),
+        prd_f: ti.template(),
+        periodicity_f: ti.template(),
     ):
+        # Zero-dimensional fields rather than Python vectors, so the current
+        # box is read at launch instead of being baked in at compile time.
+        prd = prd_f[None]
+        periodicity = periodicity_f[None]
         for i in range(nlocal):
             xi = x[i]
             ri = radius[i]
@@ -61,7 +65,7 @@ class ComputeContactAtom:
             atom.radius,
             neighbor.num_neighbors,
             neighbor.neighbors,
-            domain.prd,
-            domain.periodicity,
+            domain.prd_f,
+            domain.periodicity_f,
         )
         return self.contact_count.to_numpy()[:atom.nlocal]

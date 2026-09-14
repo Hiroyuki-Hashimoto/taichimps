@@ -29,9 +29,13 @@ class ComputeFabric:
         radius: ti.template(),
         num_neigh: ti.template(),
         neighbors: ti.template(),
-        prd: ti.template(),
-        periodicity: ti.template(),
+        prd_f: ti.template(),
+        periodicity_f: ti.template(),
     ):
+        # Zero-dimensional fields rather than Python vectors, so the current
+        # box is read at launch instead of being baked in at compile time.
+        prd = prd_f[None]
+        periodicity = periodicity_f[None]
         self.num_contacts[None] = 0
         s_xx = 0.0
         s_yy = 0.0
@@ -96,7 +100,7 @@ class ComputeFabric:
             atom.radius,
             neighbor.num_neighbors,
             neighbor.neighbors,
-            domain.prd,
-            domain.periodicity,
+            domain.prd_f,
+            domain.periodicity_f,
         )
         return self.phi.to_numpy(), int(self.num_contacts[None])
