@@ -12,3 +12,4 @@ dist/
 *.vtp
 *.vtk
 
+validation/results/

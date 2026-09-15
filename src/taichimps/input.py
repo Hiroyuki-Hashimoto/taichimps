@@ -56,6 +56,10 @@ class LAMMPSInputParser:
         # every time it is referenced; storing only the value frozen at
         # definition time makes any time-dependent variable a constant.
         self.variable_exprs: dict[str, str] = {}
+        # Names currently being evaluated, so that a variable referring to
+        # itself through v_ is reported rather than recursing until the stack
+        # runs out.
+        self._resolving: set[str] = set()
         self.commands: list[str] = []
         self.default_fp = default_fp
         self.arch = arch
@@ -84,12 +88,32 @@ class LAMMPSInputParser:
         self.load_script()
 
     def evaluate_string_template(self, template_str: str) -> str:
-        """Expand variable references inside a string template (e.g. for fix print)."""
+        """
+        Expand variable references inside a string template (e.g. for fix print).
+
+        Equal-style variables are re-evaluated here rather than read out of the
+        table.  LAMMPS evaluates them at the moment of substitution, so a
+        `fix print` of `${pxx}` reports this timestep's pressure; reading the
+        stored value gave whatever the expression happened to evaluate to on
+        the line that defined it, which for `variable pxx equal c_1[1]` was the
+        literal text `c_1[1]`, printed verbatim into the output file.
+
+        Numbers are formatted the way Variable::retrieve does it, with %.15g,
+        so an integral value such as the timestep prints as `1000000` rather
+        than `1000000.0`.
+        """
         self.update_dynamic_variables()
 
         def sub_var(match: re.Match) -> str:
             var_name = match.group(1)
+            if var_name in self.variable_exprs:
+                try:
+                    return f"{self.evaluate_variable(var_name):.15g}"
+                except (ValueError, KeyError):
+                    pass
             val = self.variables.get(var_name, "")
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                return f"{float(val):.15g}"
             return str(val)
 
         res = re.sub(r"\$\{([a-zA-Z0-9_]+)\}", sub_var, template_str)
@@ -102,6 +126,12 @@ class LAMMPSInputParser:
             self.variables["step"] = float(self.simulation.timestep)
             self.variables["lstep"] = float(self.simulation.timestep)
             self.variables["dt"] = float(self.simulation.dt)
+            # `time` is elapsed simulation time, as the thermo keyword of the
+            # same name reports it; the reference scripts define
+            # `variable time equal time`.
+            self.variables["time"] = float(
+                self.simulation.timestep * self.simulation.dt
+            )
         if self.domain is not None:
             lx = float(self.domain.prd[0])
             ly = float(self.domain.prd[1])
@@ -680,6 +710,25 @@ class LAMMPSInputParser:
             if isinstance(v, (int, float, ComputeVector)):
                 allowed_names[k] = v
 
+        # `v_name` is how a LAMMPS expression refers to another variable, and
+        # the reference scripts lean on it heavily:
+        #   variable p equal "(v_pxx + v_pyy + v_pzz)/3.0"
+        # Each referenced variable is re-evaluated now, so the value is this
+        # timestep's. Only the names that actually appear are resolved, both to
+        # keep the cost down and so that an unrelated broken variable elsewhere
+        # in the script cannot poison this expression.
+        for name in set(re.findall(r"\bv_([A-Za-z_][A-Za-z0-9_]*)\b", res)):
+            if name in self._resolving:
+                raise ValueError(f"variable {name!r} refers to itself")
+            if name in self.variable_exprs or name in self.variables:
+                self._resolving.add(name)
+                try:
+                    allowed_names[f"v_{name}"] = self.evaluate_variable(name)
+                except (ValueError, KeyError):
+                    pass
+                finally:
+                    self._resolving.discard(name)
+
         try:
             val = eval(res, {"__builtins__": None}, allowed_names)
             return float(val)
@@ -1099,6 +1148,7 @@ class LAMMPSInputParser:
                         filepath=filepath,
                         title=title,
                         screen=screen,
+                        fix_id=fix_id,
                     )
                     self.fixes[fix_id] = fix_inst
                     if self.simulation:

@@ -26,6 +26,12 @@ class Fix(ABC):
         # clears it once it has rebuilt. LAMMPS calls the same thing
         # `next_reneighbor`.
         self.force_reneighbor = False
+        # The timestep currently being executed, kept up to date by Simulation.
+        # LAMMPS fixes read update->ntimestep for this; a fix that fires every
+        # N steps has to test the *absolute* step number against N, not count
+        # its own invocations, or its output lands on different steps depending
+        # on where the run happened to start.
+        self.timestep: int = 0
 
     def setup(self, nsteps_total: int = 0, dt: float = 0.0) -> None:
         """

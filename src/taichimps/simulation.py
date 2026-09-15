@@ -198,6 +198,17 @@ class Simulation:
 
     def _sub_step_inner(self) -> None:
         """Execute a single time step without CPU synchronizations or periodic I/O."""
+        # LAMMPS increments ntimestep at the top of the step (Verlet::run does
+        # `ntimestep = ++update->ntimestep`), so everything inside the step --
+        # the neighbor decision, fix print, dumps -- sees the number of the step
+        # being executed. Incrementing at the bottom instead left every one of
+        # them one step behind.
+        self.timestep += 1
+        for fix in self.fixes:
+            fix.timestep = self.timestep
+        if self.integrator is not None:
+            self.integrator.timestep = self.timestep
+
         # 1. Initial integration (Velocity Verlet 1st half)
         if self.integrator is not None:
             self.integrator.initial_integrate(self.atom, self.dt)
@@ -228,8 +239,6 @@ class Simulation:
         # 7. Fix end_of_step (e.g. deform/pressure, print)
         for fix in self.fixes:
             fix.end_of_step(self.atom, self.dt)
-
-        self.timestep += 1
 
     def run_gpu(self, steps: int) -> None:
         """

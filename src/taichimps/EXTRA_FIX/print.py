@@ -24,6 +24,7 @@ class FixPrint(Fix):
         filepath: str | Path | None = None,
         title: str | None = None,
         screen: bool = False,
+        fix_id: str = "",
     ) -> None:
         super().__init__(domain)
         self.nevery = max(1, int(nevery))
@@ -41,13 +42,22 @@ class FixPrint(Fix):
                 clean_title = self.title.strip("\"'")
                 self.file_handle.write(f"{clean_title}\n")
             elif self.title is None:
-                self.file_handle.write("# Fix print output\n")
+                suffix = f" for fix {fix_id}" if fix_id else ""
+                self.file_handle.write(f"# Fix print output{suffix}\n")
             self.file_handle.flush()
 
     def end_of_step(self, atom: AtomSystem, dt: float) -> None:
-        """Evaluate string and write to file at specified intervals."""
+        """
+        Evaluate the string and write it out on every Nth timestep.
+
+        The test is on the absolute timestep, as in FixPrint::end_of_step,
+        not on a count of invocations.  Counting invocations put the output on
+        run-relative steps, so a run resumed from a restart at step 1000000
+        printed at 1002000, 1004000 ... where LAMMPS prints at 1010000,
+        1020000 ... and the two could not be compared at all.
+        """
         self.step_count += 1
-        if self.step_count % self.nevery == 0:
+        if self.timestep % self.nevery == 0:
             output_str = self.eval_fn(self.template_str)
             if self.file_handle:
                 self.file_handle.write(f"{output_str}\n")
