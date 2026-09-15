@@ -512,6 +512,7 @@ def write_restart(
     units: str = "si",
     pair: object | None = None,
     pair_style: str = "granular",
+    nlist: object | None = None,
 ) -> None:
     """
     Write a single-processor LAMMPS restart file for `atom_style sphere`.
@@ -523,6 +524,10 @@ def write_restart(
     Pass `pair` (a PairGranular) to store the contact model too, the way
     `write_restart` does; without it the file carries no force field section and
     whatever reads it has to set the pair style itself.
+
+    `nlist` is needed alongside `history`: the contact history is stored per
+    pair, so which atom a contact belongs to is only known from the neighbour
+    list's pair arrays.
     """
     n = atom.nlocal  # type: ignore[attr-defined]
     w = _Writer()
@@ -590,7 +595,9 @@ def write_restart(
         _write_counted_string(w, "NEIGH_HISTORY")
         w.raw(struct.pack(
             "<i",
-            _neigh_history_maxsize(history, atom.tag.to_numpy()[:n], n),  # type: ignore[attr-defined]
+            _neigh_history_maxsize(
+                history, nlist, atom.tag.to_numpy()[:n], n  # type: ignore[attr-defined]
+            ),
         ))
     else:
         w.raw(struct.pack("<i", 0))
@@ -600,7 +607,7 @@ def write_restart(
     w.end_section()
 
     # --- one PERPROC chunk
-    payload = _pack_atoms(atom, history, n)
+    payload = _pack_atoms(atom, history, nlist, n)
     w.parts.append(struct.pack("<ii", PERPROC, len(payload)))
     w.parts.append(payload.astype("<f8").tobytes())
     w.raw(MAGIC)
@@ -640,15 +647,17 @@ def _write_pair_restart(w: _Writer, pair: object, style: str, ntypes: int) -> No
             w.raw(struct.pack("<idi", 1, -1.0, 0))
 
 
-def _neigh_history_maxsize(history: object, tag: np.ndarray, n: int) -> int:
+def _neigh_history_maxsize(history: object, nlist: object, tag: np.ndarray,
+                           n: int) -> int:
     """The largest per-atom FixNeighHistory record, in doubles."""
-    contacts = _both_sided_history(history, tag, n)
+    contacts = _both_sided_history(history, nlist, tag, n)
     if not contacts:
         return 2
     return 2 + 4 * max(len(c) for c in contacts)
 
 
-def _pack_atoms(atom: object, history: object | None, n: int) -> np.ndarray:
+def _pack_atoms(atom: object, history: object | None, nlist: object | None,
+                n: int) -> np.ndarray:
     x = atom.x.to_numpy()[:n]        # type: ignore[attr-defined]
     v = atom.v.to_numpy()[:n]        # type: ignore[attr-defined]
     omega = atom.omega.to_numpy()[:n]  # type: ignore[attr-defined]
@@ -657,7 +666,7 @@ def _pack_atoms(atom: object, history: object | None, n: int) -> np.ndarray:
     tag = atom.tag.to_numpy()[:n]        # type: ignore[attr-defined]
     atype = atom.atom_type.to_numpy()[:n]  # type: ignore[attr-defined]
 
-    contacts = _both_sided_history(history, tag, n)
+    contacts = _both_sided_history(history, nlist, tag, n)
 
     out: list[float] = []
     for i in range(n):
@@ -683,7 +692,7 @@ def _pack_atoms(atom: object, history: object | None, n: int) -> np.ndarray:
 
 
 def _both_sided_history(
-    history: object, tag: np.ndarray, n: int
+    history: object, nlist: object, tag: np.ndarray, n: int
 ) -> list[list[tuple[int, np.ndarray]]] | None:
     """
     Expand taichimps' one entry per contact into the two LAMMPS stores.
@@ -695,17 +704,14 @@ def _both_sided_history(
     would load back with every second contact's history silently zeroed, since
     FixNeighHistory::post_neighbor looks the partner up under each atom in turn.
     """
-    if history is None:
+    if history is None or nlist is None:
         return None
-    partner = history.partner.to_numpy()[:n]  # type: ignore[attr-defined]
-    values = history.shear.to_numpy()[:n]     # type: ignore[attr-defined]
+    own = history.touching_by_atom(nlist, n)  # type: ignore[attr-defined]
 
     index_of_tag = {int(t): i for i, t in enumerate(tag)}
     out: list[list[tuple[int, np.ndarray]]] = [[] for _ in range(n)]
     for i in range(n):
-        for k in np.nonzero(partner[i] >= 0)[0]:
-            ptag = int(partner[i][k])
-            value = values[i][k]
+        for ptag, value in own[i]:
             out[i].append((ptag, value))
             j = index_of_tag.get(ptag)
             if j is not None:

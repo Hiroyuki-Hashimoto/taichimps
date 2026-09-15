@@ -294,151 +294,148 @@ class PairGranular(GranularPair):
         rmass: ti.template(),
         tag: ti.template(),
         virial: ti.template(),
-        num_neighbors: ti.template(),
-        neighbors: ti.template(),
+        npairs: ti.template(),
+        pair_i: ti.template(),
+        pair_j: ti.template(),
         shear_hist: ti.template(),
         partner_hist: ti.template(),
     ):
-        # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
-        # not passed at launch. A loop whose bound is a runtime argument makes
-        # Taichi emit a second, serial GPU launch ahead of the parallel one
-        # just to establish the range; measured at 6.9 us per call on CUDA,
-        # which at this system size is a third of the kernel's own cost.
-        # Taichi recompiles per distinct value, so a run whose particle count
-        # never changes compiles this once.
-        for i in range(nlocal):
+        # One thread per candidate contact, not per particle. At 1400
+        # particles the per-particle form gives 1400 threads where the GPU
+        # wants tens of thousands, and they are unbalanced besides -- an atom
+        # may have anywhere from zero to max_neighbors partners, so lanes in
+        # the same warp sit idle waiting for the busiest one. One thread per
+        # pair gives 8400 here, all with identical work. Measured 3.2x on this
+        # system size; the advantage narrows as the system grows and the
+        # per-particle form starts to fill the machine on its own.
+        for nc in range(npairs[None]):
+            i = pair_i[nc]
+            j = pair_j[nc]
             xi = x[i]
             vi = v[i]
             ri = radius[i]
             mi = rmass[i]
             oi = omega[i]
+            rj = radius[j]
+            radsum = ri + rj
+            dpos, dvj = self.domain.minimum_image_and_vshift(xi - x[j])
+            rsq = dpos.dot(dpos)
 
-            n_neigh = num_neighbors[i]
-            for k in range(n_neigh):
-                j = neighbors[i, k]
-                if j < 0:
-                    continue
+            if rsq < radsum * radsum and rsq > 1e-28:
+                r = ti.sqrt(rsq)
+                rinv = 1.0 / r
+                n = dpos * rinv
+                delta = radsum - r
+                reff = (ri * rj) / radsum
+                meff = (mi * rmass[j]) / (mi + rmass[j])
+                # contact_radius = sqrt(dR), dR = delta * Reff
+                a = ti.sqrt(delta * reff)
 
-                rj = radius[j]
-                radsum = ri + rj
-                dpos, dvj = self.domain.minimum_image_and_vshift(xi - x[j])
-                rsq = dpos.dot(dpos)
+                # Under `remap v` the periodic image of j moves with the
+                # deforming lattice, so its velocity is offset.
+                vr = vi - (v[j] + dvj)
+                vnnr = vr.dot(n)
+                vt = vr - vnnr * n
+                wr = ri * oi + rj * omega[j]
+                # GranularModel: cross3(wr, nx, temp); sub3(vt, temp, vtr)
+                vtr = vt - wr.cross(n)
+                vrel = vtr.norm()
 
-                if rsq < radsum * radsum and rsq > 1e-28:
-                    r = ti.sqrt(rsq)
-                    rinv = 1.0 / r
-                    n = dpos * rinv
-                    delta = radsum - r
-                    reff = (ri * rj) / radsum
-                    meff = (mi * rmass[j]) / (mi + rmass[j])
-                    # contact_radius = sqrt(dR), dR = delta * Reff
-                    a = ti.sqrt(delta * reff)
-
-                    # Under `remap v` the periodic image of j moves with the
-                    # deforming lattice, so its velocity is offset.
-                    vr = vi - (v[j] + dvj)
-                    vnnr = vr.dot(n)
-                    vt = vr - vnnr * n
-                    wr = ri * oi + rj * omega[j]
-                    # GranularModel: cross3(wr, nx, temp); sub3(vt, temp, vtr)
-                    vtr = vt - wr.cross(n)
-                    vrel = vtr.norm()
-
-                    # --- normal elastic force -------------------------------
-                    fne = 0.0
-                    if ti.static(self.normal_uses_contact_radius):
-                        fne = self.kn * a * delta
-                    else:
-                        fne = self.kn * delta
-
-                    # --- damping --------------------------------------------
-                    damp_prefactor = 0.0
-                    if ti.static(self.damping_id == DAMPING_VELOCITY):
-                        damp_prefactor = self.damp
-                    elif ti.static(self.damping_id == DAMPING_MASS_VELOCITY):
-                        damp_prefactor = self.damp * meff
-                    elif ti.static(self.damping_id == DAMPING_VISCOELASTIC):
-                        damp_prefactor = self.damp * meff * a
-                    elif ti.static(
-                        self.damping_id in (DAMPING_TSUJI, DAMPING_COEFF_RESTITUTION)
-                    ):
-                        arg = 0.0
-                        if delta > 0.0:
-                            arg = ti.max(0.0, meff * fne / delta)
-                        damp_prefactor = self.damp * ti.sqrt(arg)
-
-                    fntot = fne - damp_prefactor * vnnr
-                    if ti.static(self.limit_damping == 1):
-                        fntot = max(fntot, 0.0)
-
-                    # GranSubModNormal::set_fncrit()
-                    fscrit = self.mu * ti.abs(fntot)
-
-                    # --- tangential -----------------------------------------
-                    fs = ti.Vector([0.0, 0.0, 0.0])
-                    if ti.static(self.tangential_id == TANGENTIAL_LINEAR_NOHISTORY):
-                        damp_t = self.xt * damp_prefactor
-                        ft = 0.0
-                        if vrel != 0.0:
-                            ft = ti.min(fscrit, damp_t * vrel) / vrel
-                        fs = -ft * vtr
-                    elif ti.static(self.uses_history):
-                        jtag = tag[j]
-                        hist = shear_hist[i, k]
-                        if partner_hist[i, k] != jtag:
-                            hist = ti.Vector([0.0, 0.0, 0.0])
-                            partner_hist[i, k] = jtag
-
-                        k_eff = self.kt
-                        if ti.static(self.tangential_scales_k):
-                            k_eff = self.kt * a
-                        damp_t = self.xt * damp_prefactor
-
-                        if history_update != 0:
-                            rsht = hist.dot(n)
-                            if ti.abs(rsht) * k_eff > EPSILON * fscrit:
-                                hist = self._rotate_rescale(hist, n)
-                            hist = hist + vtr * dt
-
-                        fdamp = -damp_t * vtr
-                        fs = -k_eff * hist + fdamp
-
-                        magfs = fs.norm()
-                        if magfs > fscrit:
-                            if hist.norm() != 0.0:
-                                fs = fs * (fscrit / magfs)
-                                # history = elastic part of the rescaled force
-                                hist = -(fs - fdamp) / k_eff
-                            else:
-                                fs = ti.Vector([0.0, 0.0, 0.0])
-
-                        shear_hist[i, k] = hist
-
-                    f_total = fntot * n + fs
-
-                    ti.atomic_add(f[i], f_total)
-                    ti.atomic_add(f[j], -f_total)
-
-                    # torquesi/j = -(n x fs) * (rad - delta/2)
-                    tor = -n.cross(fs)
-                    ti.atomic_add(torque[i], (ri - 0.5 * delta) * tor)
-                    ti.atomic_add(torque[j], (rj - 0.5 * delta) * tor)
-
-                    # Pairwise virial, as in Pair::ev_tally_xyz()
-                    vir = 0.5 * ti.Vector([
-                        dpos[0] * f_total[0],
-                        dpos[1] * f_total[1],
-                        dpos[2] * f_total[2],
-                        dpos[0] * f_total[1],
-                        dpos[0] * f_total[2],
-                        dpos[1] * f_total[2],
-                    ])
-                    ti.atomic_add(virial[i], vir)
-                    ti.atomic_add(virial[j], vir)
+                # --- normal elastic force -------------------------------
+                fne = 0.0
+                if ti.static(self.normal_uses_contact_radius):
+                    fne = self.kn * a * delta
                 else:
-                    if ti.static(self.uses_history):
-                        partner_hist[i, k] = -1
-                        shear_hist[i, k] = ti.Vector([0.0, 0.0, 0.0])
+                    fne = self.kn * delta
+
+                # --- damping --------------------------------------------
+                damp_prefactor = 0.0
+                if ti.static(self.damping_id == DAMPING_VELOCITY):
+                    damp_prefactor = self.damp
+                elif ti.static(self.damping_id == DAMPING_MASS_VELOCITY):
+                    damp_prefactor = self.damp * meff
+                elif ti.static(self.damping_id == DAMPING_VISCOELASTIC):
+                    damp_prefactor = self.damp * meff * a
+                elif ti.static(
+                    self.damping_id in (DAMPING_TSUJI, DAMPING_COEFF_RESTITUTION)
+                ):
+                    arg = 0.0
+                    if delta > 0.0:
+                        arg = ti.max(0.0, meff * fne / delta)
+                    damp_prefactor = self.damp * ti.sqrt(arg)
+
+                fntot = fne - damp_prefactor * vnnr
+                if ti.static(self.limit_damping == 1):
+                    fntot = max(fntot, 0.0)
+
+                # GranSubModNormal::set_fncrit()
+                fscrit = self.mu * ti.abs(fntot)
+
+                # --- tangential -----------------------------------------
+                fs = ti.Vector([0.0, 0.0, 0.0])
+                if ti.static(self.tangential_id == TANGENTIAL_LINEAR_NOHISTORY):
+                    damp_t = self.xt * damp_prefactor
+                    ft = 0.0
+                    if vrel != 0.0:
+                        ft = ti.min(fscrit, damp_t * vrel) / vrel
+                    fs = -ft * vtr
+                elif ti.static(self.uses_history):
+                    jtag = tag[j]
+                    hist = shear_hist[nc]
+                    if partner_hist[nc] != jtag:
+                        hist = ti.Vector([0.0, 0.0, 0.0])
+                        partner_hist[nc] = jtag
+
+                    k_eff = self.kt
+                    if ti.static(self.tangential_scales_k):
+                        k_eff = self.kt * a
+                    damp_t = self.xt * damp_prefactor
+
+                    if history_update != 0:
+                        rsht = hist.dot(n)
+                        if ti.abs(rsht) * k_eff > EPSILON * fscrit:
+                            hist = self._rotate_rescale(hist, n)
+                        hist = hist + vtr * dt
+
+                    fdamp = -damp_t * vtr
+                    fs = -k_eff * hist + fdamp
+
+                    magfs = fs.norm()
+                    if magfs > fscrit:
+                        if hist.norm() != 0.0:
+                            fs = fs * (fscrit / magfs)
+                            # history = elastic part of the rescaled force
+                            hist = -(fs - fdamp) / k_eff
+                        else:
+                            fs = ti.Vector([0.0, 0.0, 0.0])
+
+                    shear_hist[nc] = hist
+
+                f_total = fntot * n + fs
+
+                ti.atomic_add(f[i], f_total)
+                ti.atomic_add(f[j], -f_total)
+
+                # torquesi/j = -(n x fs) * (rad - delta/2)
+                tor = -n.cross(fs)
+                ti.atomic_add(torque[i], (ri - 0.5 * delta) * tor)
+                ti.atomic_add(torque[j], (rj - 0.5 * delta) * tor)
+
+                # Pairwise virial, as in Pair::ev_tally_xyz()
+                vir = 0.5 * ti.Vector([
+                    dpos[0] * f_total[0],
+                    dpos[1] * f_total[1],
+                    dpos[2] * f_total[2],
+                    dpos[0] * f_total[1],
+                    dpos[0] * f_total[2],
+                    dpos[1] * f_total[2],
+                ])
+                ti.atomic_add(virial[i], vir)
+                ti.atomic_add(virial[j], vir)
+            else:
+                if ti.static(self.uses_history):
+                    partner_hist[nc] = -1
+                    shear_hist[nc] = ti.Vector([0.0, 0.0, 0.0])
 
     def compute(
         self,
@@ -463,8 +460,9 @@ class PairGranular(GranularPair):
             atom.rmass,
             atom.tag,
             atom.virial,
-            nlist.num_neighbors,
-            nlist.neighbors,
+            nlist.npairs,
+            nlist.pair_i,
+            nlist.pair_j,
             history.shear,
             history.partner,
         )

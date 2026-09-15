@@ -147,7 +147,7 @@ class Simulation:
             return False
 
         if self.history is not None:
-            self.history.save_state(self.atom)
+            self.history.save_state(self.atom, self.neighbor)
         self.domain.pbc(self.atom)
         # The bin layout is worked out on the host from the box, so the mirror
         # has to be current here. A rebuild is rare (thousands of steps apart),

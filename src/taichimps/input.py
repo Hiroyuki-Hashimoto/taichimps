@@ -571,6 +571,7 @@ class LAMMPSInputParser:
             dt=self.dt,
             history=history,
             pair=pair if isinstance(pair, PairGranular) else None,
+            nlist=self.simulation.neighbor if self.simulation else self.neighbor,
         )
 
     def _do_write_restart(self, name: str) -> None:

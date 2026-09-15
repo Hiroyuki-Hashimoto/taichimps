@@ -55,86 +55,86 @@ class GranHertz(GranularPair):
         radius: ti.template(),
         rmass: ti.template(),
         virial: ti.template(),
-        num_neighbors: ti.template(),
-        neighbors: ti.template(),
+        npairs: ti.template(),
+        pair_i: ti.template(),
+        pair_j: ti.template(),
     ):
-        for i in range(nlocal):
+            # One thread per candidate contact, not per particle: at this
+            # system size the per-particle form leaves the GPU mostly idle
+            # (1400 threads) and unbalanced (0..max_neighbors partners each).
+            # See PairGranular.compute_kernel for the measurements.
+        for nc in range(npairs[None]):
+            i = pair_i[nc]
+            j = pair_j[nc]
             xi = x[i]
             vi = v[i]
             ri = radius[i]
             mi = rmass[i]
             oi = omega[i]
+            xj = x[j]
+            vj = v[j]
+            rj = radius[j]
+            mj = rmass[j]
+            oj = omega[j]
 
-            n_neigh = num_neighbors[i]
-            for k in range(n_neigh):
-                j = neighbors[i, k]
-                if j < 0:
-                    continue
+            dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
+            rsq = dpos.dot(dpos)
+            radsum = ri + rj
 
-                xj = x[j]
-                vj = v[j]
-                rj = radius[j]
-                mj = rmass[j]
-                oj = omega[j]
+            if rsq < radsum * radsum and rsq > 1e-28:
+                r = ti.sqrt(rsq)
+                delta = radsum - r
+                reff = (ri * rj) / (ri + rj)
+                meff = (mi * mj) / (mi + mj)
+                polyhertz = ti.sqrt(reff * delta)
 
-                dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
-                rsq = dpos.dot(dpos)
-                radsum = ri + rj
+                rsqinv = 1.0 / rsq
+                rinv = 1.0 / r
+                # Under `remap v` the periodic image of j moves with the
+                # deforming lattice, so its velocity is offset.
+                vrel_t = vi - (vj + dvj)
+                vnnr = vrel_t.dot(dpos)
+                vn_vec = dpos * (vnnr * rsqinv)
+                vt_vec = vrel_t - vn_vec
+                wr = (ri * oi + rj * oj) * rinv
+                # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
+                # dpos.cross(wr) = n x W = -(W x n), hence the plus sign.
+                vtr = vt_vec + dpos.cross(wr)
+                vrel = vtr.norm()
 
-                if rsq < radsum * radsum and rsq > 1e-28:
-                    r = ti.sqrt(rsq)
-                    delta = radsum - r
-                    reff = (ri * rj) / (ri + rj)
-                    meff = (mi * mj) / (mi + mj)
-                    polyhertz = ti.sqrt(reff * delta)
+                damp = meff * self.gamman * vnnr * rsqinv
+                ccel = (self.kn * delta * rinv - damp) * polyhertz
+                if self.limit_damping == 1 and ccel < 0.0:
+                    ccel = 0.0
 
-                    rsqinv = 1.0 / rsq
-                    rinv = 1.0 / r
-                    # Under `remap v` the periodic image of j moves with the
-                    # deforming lattice, so its velocity is offset.
-                    vrel_t = vi - (vj + dvj)
-                    vnnr = vrel_t.dot(dpos)
-                    vn_vec = dpos * (vnnr * rsqinv)
-                    vt_vec = vrel_t - vn_vec
-                    wr = (ri * oi + rj * oj) * rinv
-                    # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
-                    # dpos.cross(wr) = n x W = -(W x n), hence the plus sign.
-                    vtr = vt_vec + dpos.cross(wr)
-                    vrel = vtr.norm()
+                fn_coulomb = self.xmu * ti.abs(ccel * r)
+                fs_damp = meff * self.gammat * vrel
 
-                    damp = meff * self.gamman * vnnr * rsqinv
-                    ccel = (self.kn * delta * rinv - damp) * polyhertz
-                    if self.limit_damping == 1 and ccel < 0.0:
-                        ccel = 0.0
+                ft = 0.0
+                if vrel > 1e-16:
+                    ft = ti.min(fn_coulomb, fs_damp) / vrel
 
-                    fn_coulomb = self.xmu * ti.abs(ccel * r)
-                    fs_damp = meff * self.gammat * vrel
+                fs_vec = -ft * vtr
+                f_total = dpos * ccel + fs_vec
 
-                    ft = 0.0
-                    if vrel > 1e-16:
-                        ft = ti.min(fn_coulomb, fs_damp) / vrel
+                ti.atomic_add(f[i], f_total)
+                ti.atomic_add(f[j], -f_total)
 
-                    fs_vec = -ft * vtr
-                    f_total = dpos * ccel + fs_vec
+                tor = rinv * dpos.cross(fs_vec)
+                ti.atomic_add(torque[i], -ri * tor)
+                ti.atomic_add(torque[j], -rj * tor)
 
-                    ti.atomic_add(f[i], f_total)
-                    ti.atomic_add(f[j], -f_total)
-
-                    tor = rinv * dpos.cross(fs_vec)
-                    ti.atomic_add(torque[i], -ri * tor)
-                    ti.atomic_add(torque[j], -rj * tor)
-
-                    # Pairwise virial, as in Pair::ev_tally_xyz()
-                    vir = 0.5 * ti.Vector([
-                        dpos[0] * f_total[0],
-                        dpos[1] * f_total[1],
-                        dpos[2] * f_total[2],
-                        dpos[0] * f_total[1],
-                        dpos[0] * f_total[2],
-                        dpos[1] * f_total[2],
-                    ])
-                    ti.atomic_add(virial[i], vir)
-                    ti.atomic_add(virial[j], vir)
+                # Pairwise virial, as in Pair::ev_tally_xyz()
+                vir = 0.5 * ti.Vector([
+                    dpos[0] * f_total[0],
+                    dpos[1] * f_total[1],
+                    dpos[2] * f_total[2],
+                    dpos[0] * f_total[1],
+                    dpos[0] * f_total[2],
+                    dpos[1] * f_total[2],
+                ])
+                ti.atomic_add(virial[i], vir)
+                ti.atomic_add(virial[j], vir)
 
     def compute(
         self,
@@ -156,6 +156,7 @@ class GranHertz(GranularPair):
             atom.radius,
             atom.rmass,
             atom.virial,
-            nlist.num_neighbors,
-            nlist.neighbors,
+            nlist.npairs,
+            nlist.pair_i,
+            nlist.pair_j,
         )

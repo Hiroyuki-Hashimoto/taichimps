@@ -69,114 +69,114 @@ class GranHertzHistory(GranularPair):
         rmass: ti.template(),
         tag: ti.template(),
         virial: ti.template(),
-        num_neighbors: ti.template(),
-        neighbors: ti.template(),
+        npairs: ti.template(),
+        pair_i: ti.template(),
+        pair_j: ti.template(),
         shear_hist: ti.template(),
         partner_hist: ti.template(),
     ):
-        for i in range(nlocal):
+            # One thread per candidate contact, not per particle: at this
+            # system size the per-particle form leaves the GPU mostly idle
+            # (1400 threads) and unbalanced (0..max_neighbors partners each).
+            # See PairGranular.compute_kernel for the measurements.
+        for nc in range(npairs[None]):
+            i = pair_i[nc]
+            j = pair_j[nc]
             xi = x[i]
             vi = v[i]
             ri = radius[i]
             mi = rmass[i]
             oi = omega[i]
+            xj = x[j]
+            vj = v[j]
+            rj = radius[j]
+            mj = rmass[j]
+            oj = omega[j]
 
-            n_neigh = num_neighbors[i]
-            for k in range(n_neigh):
-                j = neighbors[i, k]
-                if j < 0:
-                    continue
+            dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
+            rsq = dpos.dot(dpos)
+            radsum = ri + rj
 
-                xj = x[j]
-                vj = v[j]
-                rj = radius[j]
-                mj = rmass[j]
-                oj = omega[j]
+            if rsq < radsum * radsum and rsq > 1e-28:
+                r = ti.sqrt(rsq)
+                delta = radsum - r
+                reff = (ri * rj) / (ri + rj)
+                meff = (mi * mj) / (mi + mj)
+                polyhertz = ti.sqrt(reff * delta)
 
-                dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
-                rsq = dpos.dot(dpos)
-                radsum = ri + rj
+                rsqinv = 1.0 / rsq
+                rinv = 1.0 / r
+                # Under `remap v` the periodic image of j moves with the
+                # deforming lattice, so its velocity is offset.
+                vrel_t = vi - (vj + dvj)
+                vnnr = vrel_t.dot(dpos)
+                vn_vec = dpos * (vnnr * rsqinv)
+                vt_vec = vrel_t - vn_vec
+                wr = (ri * oi + rj * oj) * rinv
+                # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
+                # dpos.cross(wr) = n x W = -(W x n), hence the plus sign.
+                vtr = vt_vec + dpos.cross(wr)
 
-                if rsq < radsum * radsum and rsq > 1e-28:
-                    r = ti.sqrt(rsq)
-                    delta = radsum - r
-                    reff = (ri * rj) / (ri + rj)
-                    meff = (mi * mj) / (mi + mj)
-                    polyhertz = ti.sqrt(reff * delta)
+                damp = meff * self.gamman * vnnr * rsqinv
+                ccel = (self.kn * delta * rinv - damp) * polyhertz
+                if self.limit_damping == 1 and ccel < 0.0:
+                    ccel = 0.0
 
-                    rsqinv = 1.0 / rsq
-                    rinv = 1.0 / r
-                    # Under `remap v` the periodic image of j moves with the
-                    # deforming lattice, so its velocity is offset.
-                    vrel_t = vi - (vj + dvj)
-                    vnnr = vrel_t.dot(dpos)
-                    vn_vec = dpos * (vnnr * rsqinv)
-                    vt_vec = vrel_t - vn_vec
-                    wr = (ri * oi + rj * oj) * rinv
-                    # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
-                    # dpos.cross(wr) = n x W = -(W x n), hence the plus sign.
-                    vtr = vt_vec + dpos.cross(wr)
+                jtag = tag[j]
+                shear = shear_hist[nc]
+                if partner_hist[nc] != jtag:
+                    shear = ti.Vector([0.0, 0.0, 0.0])
+                    partner_hist[nc] = jtag
 
-                    damp = meff * self.gamman * vnnr * rsqinv
-                    ccel = (self.kn * delta * rinv - damp) * polyhertz
-                    if self.limit_damping == 1 and ccel < 0.0:
-                        ccel = 0.0
+                gammat_eff = meff * self.gammat
 
-                    jtag = tag[j]
-                    shear = shear_hist[i, k]
-                    if partner_hist[i, k] != jtag:
-                        shear = ti.Vector([0.0, 0.0, 0.0])
-                        partner_hist[i, k] = jtag
+                if shearupdate != 0:
+                    shear = shear + vtr * dt
+                shrmag = shear.norm()
+                if shearupdate != 0:
+                    rsht = shear.dot(dpos) * rsqinv
+                    shear = shear - rsht * dpos
 
-                    gammat_eff = meff * self.gammat
+                fs_vec = -polyhertz * (self.kt * shear + gammat_eff * vtr)
+                fs_mag = fs_vec.norm()
 
-                    if shearupdate != 0:
-                        shear = shear + vtr * dt
-                    shrmag = shear.norm()
-                    if shearupdate != 0:
-                        rsht = shear.dot(dpos) * rsqinv
-                        shear = shear - rsht * dpos
+                fn_coulomb = self.xmu * ti.abs(ccel * r)
+                if fs_mag > fn_coulomb:
+                    if shrmag != 0.0:
+                        ratio = fn_coulomb / fs_mag
+                        damp_corr = gammat_eff * vtr / self.kt
+                        shear = ratio * (shear + damp_corr) - damp_corr
+                        fs_vec = ratio * fs_vec
+                    else:
+                        fs_vec = ti.Vector([0.0, 0.0, 0.0])
 
-                    fs_vec = -polyhertz * (self.kt * shear + gammat_eff * vtr)
-                    fs_mag = fs_vec.norm()
+                shear_hist[nc] = shear
 
-                    fn_coulomb = self.xmu * ti.abs(ccel * r)
-                    if fs_mag > fn_coulomb:
-                        if shrmag != 0.0:
-                            ratio = fn_coulomb / fs_mag
-                            damp_corr = gammat_eff * vtr / self.kt
-                            shear = ratio * (shear + damp_corr) - damp_corr
-                            fs_vec = ratio * fs_vec
-                        else:
-                            fs_vec = ti.Vector([0.0, 0.0, 0.0])
+                f_total = dpos * ccel + fs_vec
 
-                    shear_hist[i, k] = shear
+                ti.atomic_add(f[i], f_total)
+                ti.atomic_add(f[j], -f_total)
 
-                    f_total = dpos * ccel + fs_vec
+                # Legacy gran/hertz/history uses the full radii as the
+                # moment arm; the (radi - delta/2) form belongs to the
+                # newer pair granular (GranularModel::calculate_forces).
+                tor = rinv * dpos.cross(fs_vec)
+                ti.atomic_add(torque[i], -ri * tor)
+                ti.atomic_add(torque[j], -rj * tor)
 
-                    ti.atomic_add(f[i], f_total)
-                    ti.atomic_add(f[j], -f_total)
-
-                    # Legacy gran/hertz/history uses the full radii as the
-                    # moment arm; the (radi - delta/2) form belongs to the
-                    # newer pair granular (GranularModel::calculate_forces).
-                    tor = rinv * dpos.cross(fs_vec)
-                    ti.atomic_add(torque[i], -ri * tor)
-                    ti.atomic_add(torque[j], -rj * tor)
-
-                    vir = 0.5 * ti.Vector([
-                        dpos[0] * f_total[0],
-                        dpos[1] * f_total[1],
-                        dpos[2] * f_total[2],
-                        dpos[0] * f_total[1],
-                        dpos[0] * f_total[2],
-                        dpos[1] * f_total[2],
-                    ])
-                    ti.atomic_add(virial[i], vir)
-                    ti.atomic_add(virial[j], vir)
-                else:
-                    partner_hist[i, k] = -1
-                    shear_hist[i, k] = ti.Vector([0.0, 0.0, 0.0])
+                vir = 0.5 * ti.Vector([
+                    dpos[0] * f_total[0],
+                    dpos[1] * f_total[1],
+                    dpos[2] * f_total[2],
+                    dpos[0] * f_total[1],
+                    dpos[0] * f_total[2],
+                    dpos[1] * f_total[2],
+                ])
+                ti.atomic_add(virial[i], vir)
+                ti.atomic_add(virial[j], vir)
+            else:
+                partner_hist[nc] = -1
+                shear_hist[nc] = ti.Vector([0.0, 0.0, 0.0])
 
     def compute(
         self,
@@ -201,8 +201,9 @@ class GranHertzHistory(GranularPair):
             atom.rmass,
             atom.tag,
             atom.virial,
-            nlist.num_neighbors,
-            nlist.neighbors,
+            nlist.npairs,
+            nlist.pair_i,
+            nlist.pair_j,
             history.shear,
             history.partner,
         )
