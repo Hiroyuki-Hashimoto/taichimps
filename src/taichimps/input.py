@@ -133,6 +133,10 @@ class LAMMPSInputParser:
                 self.simulation.timestep * self.simulation.dt
             )
         if self.domain is not None:
+            # lx/ly/lz/vol come off the host mirror, so it has to be current.
+            # No-op unless the device servo is running, and then this is only
+            # reached on the steps that actually print something.
+            self.domain.pull()
             lx = float(self.domain.prd[0])
             ly = float(self.domain.prd[1])
             lz = float(self.domain.prd[2])

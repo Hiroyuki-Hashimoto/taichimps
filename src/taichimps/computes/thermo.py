@@ -141,6 +141,11 @@ class Computes:
         """
         if atom.nlocal == 0:
             return np.zeros(6, dtype=np.float64)
+        # Costs nothing unless a kernel has moved the box on without telling
+        # the host, which only happens on the device servo path -- and there
+        # this is reached only when something asks for the pressure, i.e. on
+        # output steps.
+        domain.pull()
         vol = domain.volume
         if vol <= 0.0:
             return np.zeros(6, dtype=np.float64)

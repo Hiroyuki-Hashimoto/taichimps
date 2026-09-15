@@ -149,6 +149,10 @@ class Simulation:
         if self.history is not None:
             self.history.save_state(self.atom)
         self.domain.pbc(self.atom)
+        # The bin layout is worked out on the host from the box, so the mirror
+        # has to be current here. A rebuild is rare (thousands of steps apart),
+        # which is why this pull is affordable and a per-step one would not be.
+        self.domain.pull()
         self.neighbor.build(self.atom)
         if self.history is not None:
             self.history.restore_state(self.atom, self.neighbor)
@@ -283,6 +287,8 @@ class Simulation:
 
             remaining -= chunk
 
+        self.domain.pull()
+
     def step(self) -> None:
         """
         Execute a single Velocity Verlet DEM timestep:
@@ -297,6 +303,12 @@ class Simulation:
         self._sub_step_inner()
 
         # Periodic dump output
+        if self.dumps or self.restart_every:
+            due = any(self.timestep % freq == 0 for _, freq in self.dumps) or (
+                self.restart_every and self.timestep % self.restart_every == 0
+            )
+            if due:
+                self.domain.pull()
         for dump_writer, freq in self.dumps:
             if self.timestep % freq == 0:
                 dump_writer.write_dump(self.timestep, self.domain, self.atom)
@@ -311,3 +323,8 @@ class Simulation:
             self.init_simulation()
         for _ in range(steps):
             self.step()
+        # The end of a run is a natural place to settle up: whoever looks at the
+        # box next -- a test, a script, the next run's setup -- should not have
+        # to know that a kernel was the last one to touch it. Once per run, so
+        # the synchronisation costs nothing.
+        self.domain.pull()

@@ -71,6 +71,17 @@ BOX_STYLES = ("none", "volume", "pressure")
 
 COUPLE_CHOICES = ("none", "xyz", "xy", "yz", "xz")
 
+# Style codes for the device servo. A Taichi kernel cannot branch on a Python
+# string, so the style of each entry travels as a small integer.
+S_NONE, S_ERATE, S_TRATE, S_VEL, S_WIGGLE = 0, 1, 2, 3, 4
+S_FINAL, S_DELTA, S_SCALE, S_PRESSURE, S_PMEAN = 5, 6, 7, 8, 9
+DEVICE_STYLE_CODE = {
+    "none": S_NONE, "erate": S_ERATE, "trate": S_TRATE, "vel": S_VEL,
+    "wiggle": S_WIGGLE, "final": S_FINAL, "delta": S_DELTA, "scale": S_SCALE,
+    "pressure": S_PRESSURE, "pressure/mean": S_PMEAN,
+}
+COUPLE_CODE = {"none": 0, "xyz": 1, "xy": 2, "yz": 3, "xz": 4}
+
 # Styles whose target is interpolated between the box at run start and a box at
 # run end, so they need to know how long the run is.
 NEEDS_RUN_LENGTH = ("final", "scale", "delta")
@@ -202,7 +213,23 @@ class FixDeformPressure(Fix):
         self._new_prd = ti.Vector.field(3, dtype=float_type, shape=())
         self._new_tilt = ti.Vector.field(3, dtype=float_type, shape=())
 
+        # Servo state held on the device, so that the whole update can run
+        # there and the pressure never has to travel back to the host. Kept in
+        # f64 whatever float_type is: cumulative_shift accumulates an increment
+        # over millions of steps and f32 would lose it.
+        self._d_style = ti.field(ti.i32, shape=6)
+        for name in ("rate", "vel", "scale", "flo", "fhi", "dlo", "dhi",
+                     "amp", "tper", "ptarget", "pgain",
+                     "lo_start", "hi_start", "cum"):
+            setattr(self, f"_d_{name}", ti.field(ti.f64, shape=6))
+        self._d_lo = ti.field(ti.f64, shape=6)
+        self._d_hi = ti.field(ti.f64, shape=6)
+
         self.computes = Computes(float_type=float_type)
+        # Set by setup(): whether this run's settings can be served entirely on
+        # the device, and if not, why not.
+        self.on_device = False
+        self.device_reason = "setup() has not run yet"
         self.step_count = 0
         self.nsteps = 0
         self.nsteps_total = 0
@@ -364,6 +391,8 @@ class FixDeformPressure(Fix):
         box at the end of the run (final, scale, delta).
         """
         assert self.domain is not None
+        # A previous run may have left the device holding the box.
+        self.domain.pull()
         self.nsteps = 0
         self.nsteps_total = int(nsteps_total)
         self._started = True
@@ -397,6 +426,14 @@ class FixDeformPressure(Fix):
         # boundary wrap. Leaving it at zero until the first end_of_step makes
         # the first step disagree with LAMMPS.
         self.domain.set_h_rate(self._strain_h_rate(dt), vremap=(self.remap == "v"))
+
+        # Can this run keep the whole update on the device?
+        self.device_reason = self._device_path_usable()
+        self.on_device = self.device_reason == "" and self.remap in ("v", "none")
+        if not self.on_device and self.device_reason == "":
+            self.device_reason = f"remap {self.remap} is in use"
+        if self.on_device:
+            self._push_device_state()
 
     def _strain_h_rate(self, dt: float) -> np.ndarray:
         """
@@ -474,6 +511,178 @@ class FixDeformPressure(Fix):
                 nprd[1] * lam[1] + nt[2] * lam[2] + new_lo[1],
                 nprd[2] * lam[2] + new_lo[2],
             ])
+
+    # ------------------------------------------------------- the device servo
+
+    def _device_path_usable(self) -> str:
+        """
+        Why the servo cannot run on the device, or "" when it can.
+
+        The device path exists to remove the pressure read-back, which is one of
+        the two per-step host/device round trips that stop the CPU from running
+        ahead of the GPU.  It deliberately covers less than the host path: the
+        parts left out are either impossible on a device (`variable`, which
+        evaluates a string expression from the input script) or intricate enough
+        that duplicating them is not worth it for how rarely they are used.
+        Anything it does not cover falls back to the host path, unchanged.
+        """
+        for i, st in enumerate(self.sets):
+            if st.style in ("variable", "volume"):
+                return f"the {['x','y','z','yz','xz','xy'][i]} entry uses {st.style}"
+            if i >= 3 and st.style != "none":
+                return "a tilt factor is being controlled"
+            if st.style not in DEVICE_STYLE_CODE:
+                return f"style {st.style!r} has no device form"
+        if self.set_box.style != "none":
+            return "the box style is in use"
+        if self.vol_balance_p:
+            return "vol/balance/p is in use"
+        if self.domain is not None and self.domain.triclinic:
+            return "the box is triclinic"
+        return ""
+
+    def _push_device_state(self) -> None:
+        """Copy the latched per-axis settings onto the device. Once per run."""
+        style = np.zeros(6, dtype=np.int32)
+        cols = {name: np.zeros(6) for name in
+                ("rate", "vel", "scale", "flo", "fhi", "dlo", "dhi", "amp",
+                 "tper", "ptarget", "pgain", "lo_start", "hi_start", "cum")}
+        for i, st in enumerate(self.sets):
+            style[i] = DEVICE_STYLE_CODE.get(st.style, S_NONE)
+            cols["rate"][i] = st.rate
+            cols["vel"][i] = st.vel
+            cols["scale"][i] = st.scale
+            cols["flo"][i], cols["fhi"][i] = st.flo, st.fhi
+            cols["dlo"][i], cols["dhi"][i] = st.dlo, st.dhi
+            cols["amp"][i], cols["tper"][i] = st.amplitude, st.tperiod
+            cols["ptarget"][i], cols["pgain"][i] = st.ptarget, st.pgain
+            cols["lo_start"][i], cols["hi_start"][i] = st.lo_start, st.hi_start
+            cols["cum"][i] = st.cumulative_shift
+        self._d_style.from_numpy(style)
+        for name, values in cols.items():
+            getattr(self, f"_d_{name}").from_numpy(values)
+
+    @ti.func
+    def _limit_rate_device(self, rate, ptarget, max_rate, normalize):
+        """normalize/pressure then max/rate, in the LAMMPS order."""
+        out = rate
+        if normalize == 1:
+            if ptarget == 0.0:
+                # The host path rejects this combination without a max/rate at
+                # setup, so max_rate is non-zero by the time we get here.
+                if out != 0.0:
+                    out = max_rate * (1.0 if out > 0.0 else -1.0)
+            else:
+                out = out / ti.abs(ptarget)
+        if max_rate != 0.0 and ti.abs(out) > max_rate:
+            out = max_rate * (1.0 if out > 0.0 else -1.0)
+        return out
+
+    @ti.kernel
+    def _servo_kernel(self, elapsed: ti.f64, frac: ti.f64, dt: ti.f64,
+                      couple: ti.i32, max_rate: ti.f64, normalize: ti.i32,
+                      vremap: ti.i32):
+        """
+        One deformation update, start to finish, without touching the host.
+
+        Reads the virial the force kernels tallied, turns it into a pressure,
+        runs the servo, and publishes the new box straight into the fields the
+        other kernels read.  Nothing crosses the bus, which is the point: the
+        host can keep queueing work instead of waiting for the GPU at every
+        step.
+
+        Serial on purpose -- there are six axes, not six million.
+        """
+        lo = self.domain.boxlo_f[None]
+        hi = self.domain.boxhi_f[None]
+        prd = hi - lo
+        vol = prd[0] * prd[1] * prd[2]
+
+        # Pressure tensor, as compute_pressure_tensor() forms it on the host.
+        vt = ti.static(self.computes.virial_tensor)
+        pxx, pyy, pzz = vt[0] / vol, vt[1] / vol, vt[2] / vol
+        scalar = (pxx + pyy + pzz) / 3.0
+
+        # couple: the coupled dimensions see their average.
+        p0, p1, p2 = pxx, pyy, pzz
+        if couple == 1:        # xyz
+            p0 = p1 = p2 = scalar
+        elif couple == 2:      # xy
+            m = 0.5 * (pxx + pyy); p0 = m; p1 = m
+        elif couple == 3:      # yz
+            m = 0.5 * (pyy + pzz); p1 = m; p2 = m
+        elif couple == 4:      # xz
+            m = 0.5 * (pxx + pzz); p0 = m; p2 = m
+
+        for d in range(3):
+            st = self._d_style[d]
+            lo_s, hi_s = self._d_lo_start[d], self._d_hi_start[d]
+            new_lo, new_hi = lo[d], hi[d]
+
+            if st == S_NONE:
+                pass
+            elif st == S_ERATE:
+                shift = 0.5 * elapsed * self._d_rate[d] * (hi_s - lo_s)
+                new_lo, new_hi = lo_s - shift, hi_s + shift
+            elif st == S_TRATE:
+                mid = 0.5 * (lo_s + hi_s)
+                half = 0.5 * (hi_s - lo_s) * ti.exp(self._d_rate[d] * elapsed)
+                new_lo, new_hi = mid - half, mid + half
+            elif st == S_VEL:
+                shift = 0.5 * elapsed * self._d_vel[d]
+                new_lo, new_hi = lo_s - shift, hi_s + shift
+            elif st == S_WIGGLE:
+                shift = 0.5 * self._d_amp[d] * ti.sin(
+                    2.0 * 3.14159265358979323846 * elapsed / self._d_tper[d])
+                new_lo, new_hi = lo_s - shift, hi_s + shift
+            elif st == S_FINAL:
+                new_lo = lo_s + frac * (self._d_flo[d] - lo_s)
+                new_hi = hi_s + frac * (self._d_fhi[d] - hi_s)
+            elif st == S_DELTA:
+                new_lo = lo_s + frac * self._d_dlo[d]
+                new_hi = hi_s + frac * self._d_dhi[d]
+            elif st == S_SCALE:
+                mid = 0.5 * (lo_s + hi_s)
+                half = 0.5 * self._d_scale[d] * (hi_s - lo_s)
+                new_lo = lo_s + frac * ((mid - half) - lo_s)
+                new_hi = hi_s + frac * ((mid + half) - hi_s)
+            else:               # S_PRESSURE or S_PMEAN
+                pd = p0
+                if d == 1:
+                    pd = p1
+                elif d == 2:
+                    pd = p2
+                if st == S_PMEAN:
+                    pd = scalar
+                target = self._d_ptarget[d]
+                rate = self._limit_rate_device(
+                    self._d_pgain[d] * (pd - target), target, max_rate, normalize)
+                # h_rate is a rate of change of box length, not a strain rate
+                self._d_cum[d] += dt * rate * prd[d]
+                new_lo = lo_s - 0.5 * self._d_cum[d]
+                new_hi = hi_s + 0.5 * self._d_cum[d]
+
+            self._d_lo[d], self._d_hi[d] = new_lo, new_hi
+
+        new_lo_v = ti.Vector([self._d_lo[0], self._d_lo[1], self._d_lo[2]])
+        new_hi_v = ti.Vector([self._d_hi[0], self._d_hi[1], self._d_hi[2]])
+        new_prd = new_hi_v - new_lo_v
+
+        self.domain.boxlo_f[None] = new_lo_v
+        self.domain.boxhi_f[None] = new_hi_v
+        self.domain.prd_f[None] = new_prd
+        self.domain.h_rate_f[None] = ti.Vector([
+            (new_prd[0] - prd[0]) / dt,
+            (new_prd[1] - prd[1]) / dt,
+            (new_prd[2] - prd[2]) / dt,
+            0.0, 0.0, 0.0,
+        ])
+        self.domain.vremap_f[None] = vremap
+        # The device path only runs for an orthogonal box, so the tilt factors
+        # and the inverse-shape off-diagonals stay zero.
+        self.domain.tilt_f[None] = ti.Vector([0.0, 0.0, 0.0])
+        self.domain.hinv_tilt_f[None] = ti.Vector([0.0, 0.0, 0.0])
+        self.domain.triclinic_f[None] = 0
 
     # ------------------------------------------------------------------- steps
 
@@ -856,6 +1065,34 @@ class FixDeformPressure(Fix):
 
         return new_lo, new_hi, deformed, tilt, flipped
 
+    def _end_of_step_on_device(self, atom: AtomSystem, dt: float) -> None:
+        """
+        The whole deformation update, without a single host/device round trip.
+
+        Two kernel launches: one to reduce the per-atom virial the force kernel
+        tallied, one to run the servo and publish the new box. The host never
+        learns what the pressure was, which is exactly what lets it keep
+        queueing work instead of waiting for the device every step.
+
+        The host's copy of the box is left marked out of date; whoever needs it
+        (a neighbour rebuild, an output step) pulls it back then.
+        """
+        assert self.domain is not None
+        if atom.nlocal:
+            self.computes.compute_virial_kernel(
+                atom.nlocal, atom.v, atom.rmass, atom.virial, 1
+            )
+        self._servo_kernel(
+            self.nsteps * dt,
+            self.nsteps / self.nsteps_total if self.nsteps_total > 0 else 0.0,
+            dt,
+            COUPLE_CODE[self.couple],
+            self.max_rate,
+            1 if self.normalize_pressure else 0,
+            1 if self.remap == "v" else 0,
+        )
+        self.domain.mark_device_authoritative()
+
     def end_of_step(self, atom: AtomSystem, dt: float) -> None:
         if self.domain is None:
             return
@@ -867,6 +1104,10 @@ class FixDeformPressure(Fix):
         self.step_count += 1
         self.nsteps += 1
         if self.step_count % self.nevery != 0:
+            return
+
+        if self.on_device:
+            self._end_of_step_on_device(atom, dt)
             return
 
         # Bound to locals for the same reason as in _apply_strain: attribute
