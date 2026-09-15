@@ -161,6 +161,8 @@ class Simulation:
     def setup_run(self, nsteps_total: int) -> None:
         """Tell the fixes a run is starting and how long it is."""
         for fix in self.fixes:
+            if hasattr(fix, "note_atom_count"):
+                fix.note_atom_count(self.atom.nlocal)
             fix.setup(nsteps_total, self.dt)
         if self.integrator is not None:
             self.integrator.setup(nsteps_total, self.dt)

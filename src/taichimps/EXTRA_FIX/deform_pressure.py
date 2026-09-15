@@ -50,7 +50,7 @@ import numpy as np
 import taichi as ti
 
 from taichimps.atom import AtomSystem
-from taichimps.computes.thermo import Computes
+from taichimps.computes.thermo import Computes, virial_chunks
 from taichimps.domain import Domain
 from taichimps.EXTRA_FIX.base import Fix
 
@@ -230,6 +230,8 @@ class FixDeformPressure(Fix):
         # the device, and if not, why not.
         self.on_device = False
         self.device_reason = "setup() has not run yet"
+        self._chunks = 64
+        self._nlocal_hint = 0
         self.step_count = 0
         self.nsteps = 0
         self.nsteps_total = 0
@@ -383,6 +385,10 @@ class FixDeformPressure(Fix):
                     "vol/balance/p needs two dimensions holding the volume constant"
                 )
 
+    def note_atom_count(self, nlocal: int) -> None:
+        """Told by Simulation before a run, so setup() can size its reduction."""
+        self._nlocal_hint = int(nlocal)
+
     def setup(self, nsteps_total: int = 0, dt: float = 0.0) -> None:
         """
         Latch the box at the start of a run, the way FixDeform::init() does.
@@ -434,6 +440,9 @@ class FixDeformPressure(Fix):
             self.device_reason = f"remap {self.remap} is in use"
         if self.on_device:
             self._push_device_state()
+        # Fixed for the run; working it out per step would put a Python call on
+        # the per-step path for no reason.
+        self._chunks = virial_chunks(self._nlocal_hint)
 
     def _strain_h_rate(self, dt: float) -> np.ndarray:
         """
@@ -1080,7 +1089,7 @@ class FixDeformPressure(Fix):
         assert self.domain is not None
         if atom.nlocal:
             self.computes.compute_virial_kernel(
-                atom.nlocal, atom.v, atom.rmass, atom.virial, 1
+                atom.nlocal, atom.v, atom.rmass, atom.virial, 1, self._chunks
             )
         self._servo_kernel(
             self.nsteps * dt,

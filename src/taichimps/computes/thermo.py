@@ -3,6 +3,7 @@ Thermodynamic property compute routines.
 Reference: LAMMPS src/compute_temp.cpp, src/compute_pressure.cpp, src/compute_ke.cpp
 """
 
+import math
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,20 @@ from taichimps.domain import Domain
 # LAMMPS `units si`: force->boltz
 BOLTZMANN = 1.3806504e-23
 
+# The virial reduction is a two-level tree: the first pass splits the atoms
+# across this many partial sums, the second adds the partials up. Both passes
+# cost about sqrt(N) when the split is 2*sqrt(N) wide, which is why it scales
+# that way rather than being fixed -- too few chunks and the first pass is a
+# long serial walk per thread, too many and the second is (six threads times
+# chunks) of dependent adds, measured at 0.036 ms with 1024 chunks against
+# 0.017 ms with 64 for the 1400-particle case.
+MAX_VIRIAL_CHUNKS = 1024
+
+
+def virial_chunks(nlocal: int) -> int:
+    """How wide to split the virial reduction for this many atoms."""
+    return int(min(MAX_VIRIAL_CHUNKS, max(64, 2.0 * math.sqrt(max(nlocal, 1)))))
+
 
 @ti.data_oriented
 class Computes:
@@ -24,6 +39,9 @@ class Computes:
         self.ke_trans_val = ti.field(dtype=float_type, shape=())
         self.ke_rot_val = ti.field(dtype=float_type, shape=())
         self.virial_tensor = ti.field(dtype=float_type, shape=6)
+        # Per-chunk partial sums for the virial reduction. Each chunk owns its
+        # slot, so nothing is contended and nothing has to be cleared first.
+        self.virial_partial = ti.Vector.field(6, dtype=float_type, shape=MAX_VIRIAL_CHUNKS)
 
     @ti.kernel
     def compute_ke_kernel(
@@ -52,6 +70,7 @@ class Computes:
         rmass: ti.template(),
         atom_virial: ti.template(),
         keflag: ti.i32,
+        chunks: ti.template(),
     ):
         """
         Sum the pairwise virial tallied by the force kernels, plus optionally
@@ -62,30 +81,37 @@ class Computes:
         Pair::ev_tally_xyz(). Summing sum(x_i . f_i) instead -- as this used to
         -- is not translation invariant under periodic boundaries, because
         taichimps has no ghost atoms to unwrap against.
+
+        Done in two passes rather than by having every thread add into the same
+        six globals. That form put a thousand threads on six addresses, and
+        CUDA serialises atomics that collide, so it cost 0.026 ms per step --
+        more than the whole rest of the step outside the contact kernel. It
+        also needed the six globals cleared first, and a scalar statement at
+        kernel scope compiles to its own serial GPU launch. Here each chunk
+        owns a slot and simply writes it, so there is no contention and nothing
+        to clear.
         """
-        # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
-        # not passed at launch. A loop whose bound is a runtime argument makes
-        # Taichi emit a second, serial GPU launch ahead of the parallel one
-        # just to establish the range; measured at 6.9 us per call on CUDA,
-        # which at this system size is a third of the kernel's own cost.
-        # Taichi recompiles per distinct value, so a run whose particle count
-        # never changes compiles this once.
-        for k in ti.static(range(6)):
-            self.virial_tensor[k] = 0.0
+        for c in range(chunks):
+            acc = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dt=self.float_type)
+            i = c
+            while i < nlocal:
+                acc += atom_virial[i]
+                if keflag != 0:
+                    m = rmass[i]
+                    acc[0] += m * v[i][0] * v[i][0]
+                    acc[1] += m * v[i][1] * v[i][1]
+                    acc[2] += m * v[i][2] * v[i][2]
+                    acc[3] += m * v[i][0] * v[i][1]
+                    acc[4] += m * v[i][0] * v[i][2]
+                    acc[5] += m * v[i][1] * v[i][2]
+                i += chunks
+            self.virial_partial[c] = acc
 
-        for i in range(nlocal):
-            vir = atom_virial[i]
-            for k in ti.static(range(6)):
-                self.virial_tensor[k] += vir[k]
-
-            if keflag != 0:
-                m = rmass[i]
-                self.virial_tensor[0] += m * v[i][0] * v[i][0]
-                self.virial_tensor[1] += m * v[i][1] * v[i][1]
-                self.virial_tensor[2] += m * v[i][2] * v[i][2]
-                self.virial_tensor[3] += m * v[i][0] * v[i][1]
-                self.virial_tensor[4] += m * v[i][0] * v[i][2]
-                self.virial_tensor[5] += m * v[i][1] * v[i][2]
+        for k in range(6):
+            total = 0.0
+            for c in range(chunks):
+                total += self.virial_partial[c][k]
+            self.virial_tensor[k] = total
 
     def ke_trans(self, atom: AtomSystem) -> float:
         """Total translational kinetic energy."""
@@ -155,6 +181,7 @@ class Computes:
             atom.rmass,
             atom.virial,
             1 if kinetic else 0,
+            virial_chunks(atom.nlocal),
         )
         return self.virial_tensor.to_numpy() / vol
 
