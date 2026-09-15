@@ -288,3 +288,33 @@ def force_array(frame: dict[str, np.ndarray]) -> np.ndarray:
 
 def torque_array(frame: dict[str, np.ndarray]) -> np.ndarray:
     return np.stack([frame["tqx"], frame["tqy"], frame["tqz"]], axis=1)
+
+
+def run_lammps_script(workdir: Path, script: str, name: str = "in.script") -> None:
+    """
+    Run an arbitrary LAMMPS script in `workdir`.
+
+    `run_lammps` covers the single-shot parity comparisons; this is for cases
+    that need several LAMMPS invocations over the same directory, such as a run
+    interrupted by write_restart and resumed with read_restart.
+    """
+    exe = lmp_executable()
+    if exe is None:
+        raise RuntimeError("No LAMMPS executable available")
+    workdir.mkdir(parents=True, exist_ok=True)
+    (workdir / name).write_text(script)
+    proc = subprocess.run(
+        [str(exe), "-in", name, "-log", f"log.{name}"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    if proc.returncode != 0:
+        log = workdir / f"log.{name}"
+        tail = log.read_text()[-4000:] if log.exists() else ""
+        raise RuntimeError(
+            f"LAMMPS failed (exit {proc.returncode})\n"
+            f"stdout:\n{proc.stdout[-2000:]}\nstderr:\n{proc.stderr[-2000:]}\nlog:\n{tail}"
+        )

@@ -16,6 +16,7 @@ import taichi as ti
 
 from taichimps.atom import AtomSystem
 from taichimps.computes.registry import ComputeVector, build_compute
+from taichimps.contact_history import ContactHistory
 from taichimps.data_reader import read_data
 from taichimps.domain import Domain
 from taichimps.dump import DumpWriter
@@ -39,6 +40,7 @@ from taichimps.GRANULAR.hertz_history import GranHertzHistory
 from taichimps.GRANULAR.hooke import GranHooke
 from taichimps.GRANULAR.hooke_history import GranHookeHistory
 from taichimps.neighbor import NeighborList
+from taichimps.restart import parse_neigh_history, read_restart, write_restart
 from taichimps.simulation import Simulation
 
 
@@ -62,7 +64,12 @@ class LAMMPSInputParser:
         self.domain: Domain | None = None
         self.atom: AtomSystem | None = None
         self.neighbor: NeighborList | None = None
+        self.history: ContactHistory | None = None
         self.simulation: Simulation | None = None
+        # Timestep number the run starts from; non-zero after read_restart.
+        self.start_timestep: int = 0
+        self.restart_every: int = 0
+        self.restart_file: str | None = None
         self.dt: float = 1e-4
         self.thermo_freq: int = 100
         self.pair_style: Any = None
@@ -413,6 +420,140 @@ class LAMMPSInputParser:
             )
         return self.neighbor
 
+    def _ensure_history(self) -> ContactHistory | None:
+        """The ContactHistory a Simulation should use, shared with the parser."""
+        if self.history is None and self.atom is not None:
+            self.history = ContactHistory(
+                max_atoms=self.atom.max_atoms,
+                float_type=self.default_fp or ti.f64,
+            )
+        return self.history
+
+    def _do_read_restart(self, path: Path) -> None:
+        """
+        `read_restart <file>`: rebuild the box, the atoms and the contact
+        history from a LAMMPS binary restart file.
+
+        As in LAMMPS, the pair style stored in the file is restored too, so a
+        continuation script need not repeat `pair_style` / `pair_coeff`; a
+        later `pair_style` command in the script still overrides it.
+        """
+        data = read_restart(path)
+
+        self.domain = Domain(
+            boxlo=data.boxlo,
+            boxhi=data.boxhi,
+            tilt=data.tilt if any(data.tilt) else None,
+        )
+        self.domain.set_boundary(data.boundary)
+        self.atom = AtomSystem(
+            max_atoms=data.natoms + 1000, float_type=self.default_fp or ti.f64
+        )
+        self.atom.add_particles(
+            x=data.x,
+            radius=data.radius,
+            density=data.density,
+            v=data.v,
+            omega=data.omega,
+            atom_type=data.atom_type,
+            tag=data.tag,
+        )
+        self.dt = data.dt or self.dt
+        self.start_timestep = data.timestep
+        # A new box and atom set invalidate any neighbor list built before.
+        self.neighbor = None
+        self.history = None
+
+        if "NEIGH_HISTORY" in data.fix_peratom_styles and data.fix_extra:
+            history = self._ensure_history()
+            decoded = [parse_neigh_history(rec) for rec in data.fix_extra]
+            if history is not None:
+                history.load_restart(
+                    [tags for tags, _ in decoded], [vals for _, vals in decoded]
+                )
+
+        if data.pair_style:
+            self.pair_style = self._pair_from_restart(data)
+
+    def _pair_from_restart(self, data: Any) -> Any:
+        """Rebuild the pair style a restart file describes."""
+        style = data.pair_style
+        if style == "granular":
+            models = data.pair_settings.get("models") or []
+            if not models:
+                return None
+            model = models[0]
+            normal, normal_coeffs = model["normal"]
+            tangential, tangential_coeffs = model["tangential"]
+            damping, _ = model["damping"]
+            for slot in ("rolling", "twisting"):
+                name = model[slot][0]
+                if name != "none":
+                    raise ValueError(
+                        f"restart file uses pair granular {slot} model {name!r}, "
+                        "which is not implemented"
+                    )
+            # LAMMPS stores an unspecified stiffness as the sentinel -1, which
+            # is how `NULL` reaches GranSubModTangential*::coeffs_to_local().
+            tcoeffs: list[float | None] = [
+                None if abs(c + 1.0) < 1e-15 else c for c in tangential_coeffs
+            ]
+            return PairGranular(
+                domain=self.domain,
+                normal=normal,
+                normal_coeffs=list(normal_coeffs),
+                tangential=tangential,
+                tangential_coeffs=tcoeffs,
+                damping=damping,
+                limit_damping=bool(model.get("limit_damping", 0)),
+            )
+        if style in ("gran/hooke", "gran/hooke/history", "gran/hertz/history"):
+            c = data.pair_settings
+            cls = {
+                "gran/hooke": GranHooke,
+                "gran/hooke/history": GranHookeHistory,
+                "gran/hertz/history": GranHertzHistory,
+            }[style]
+            return cls(
+                domain=self.domain,
+                kn=c["kn"], kt=c["kt"],
+                gamman=c["gamman"], gammat=c["gammat"],
+                xmu=c["xmu"], dampflag=c["dampflag"],
+                limit_damping=bool(c["limit_damping"]),
+            )
+        raise ValueError(f"restart file uses pair_style {style!r}, which is not implemented")
+
+    def _restart_writer(self, path: str, timestep: int) -> None:
+        """Write one restart file; shared by `write_restart` and `restart N`."""
+        if self.atom is None or self.domain is None:
+            raise ValueError("write_restart before a system was defined")
+        history = self.simulation.history if self.simulation else self.history
+        pair = self.simulation.pair_style if self.simulation else self.pair_style
+        write_restart(
+            self.workdir / path,
+            atom=self.atom,
+            domain=self.domain,
+            timestep=timestep,
+            dt=self.dt,
+            history=history,
+            pair=pair if isinstance(pair, PairGranular) else None,
+        )
+
+    def _do_write_restart(self, name: str) -> None:
+        step = self.simulation.timestep if self.simulation else self.start_timestep
+        # LAMMPS substitutes the current timestep for a `*` in the file name.
+        self._restart_writer(name.replace("*", str(step)), step)
+
+    def _init_simulation_state(self) -> None:
+        """Carry parser-level restart settings onto a freshly built Simulation."""
+        if self.simulation is None:
+            return
+        self.simulation.timestep = self.start_timestep
+        if self.restart_every and self.restart_file:
+            self.simulation.set_restart(
+                self.restart_every, self.restart_file, self._restart_writer
+            )
+
     def compute_context(self) -> Any:
         """
         What a compute needs to evaluate itself.
@@ -700,6 +841,22 @@ class LAMMPSInputParser:
                     tag=data.tag,
                 )
 
+            elif cmd == "read_restart":
+                self._do_read_restart(self.workdir / args[0])
+
+            elif cmd == "write_restart":
+                self._do_write_restart(args[0])
+
+            elif cmd == "restart":
+                # restart <N> <file>  -- N = 0 turns periodic writing off.
+                every = int(float(self.evaluate_expression(args[0])))
+                self.restart_every = every
+                self.restart_file = args[1] if len(args) > 1 else None
+                if self.simulation is not None:
+                    self.simulation.set_restart(
+                        every, self.restart_file, self._restart_writer
+                    )
+
             elif cmd == "create_box":
                 # create_box <ntypes> <region-id>
                 # If region exists, initialize domain with it
@@ -868,10 +1025,12 @@ class LAMMPSInputParser:
                         domain=self.domain,
                         atom=self.atom,
                         neighbor=self._ensure_neighbor(),
+                        history=self._ensure_history(),
                         pair=self.pair_style,
                         dt=self.dt,
                         thermo_freq=self.thermo_freq,
                     )
+                    self._init_simulation_state()
 
                 # A plane wall/gran command can expand into two fixes (lo and hi).
                 fix_inst: Fix | list[Fix] | None = None
@@ -1418,10 +1577,12 @@ class LAMMPSInputParser:
                         domain=self.domain,
                         atom=self.atom,
                         neighbor=self._ensure_neighbor(),
+                        history=self._ensure_history(),
                         pair=self.pair_style,
                         dt=self.dt,
                         thermo_freq=self.thermo_freq,
                     )
+                    self._init_simulation_state()
                     for f in self.fixes.values():
                         self.simulation.add_fix(f)
 

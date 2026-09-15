@@ -15,6 +15,7 @@ Taichi equivalent of those two steps.
 
 from typing import Any
 
+import numpy as np
 import taichi as ti
 
 from taichimps.atom import AtomSystem
@@ -65,6 +66,13 @@ class ContactHistory:
             3, dtype=float_type, shape=(max_atoms, max_neighbors)
         )
         self.save_count = ti.field(dtype=ti.i32, shape=max_atoms)
+
+        # Set while the save buffers hold history that has not yet been placed
+        # on a neighbor list -- currently only right after read_restart.  It
+        # suppresses the next save_state(), mirroring the LAMMPS note on
+        # FixNeighHistory::pre_exchange ("do not call during setup of run ...
+        # because there is no guarantee of a current NDS").
+        self.setup_pending = False
 
         self.reset()
 
@@ -126,7 +134,7 @@ class ContactHistory:
 
     def save_state(self, atom: AtomSystem) -> None:
         """Save touching-contact history before the neighbor list is rebuilt."""
-        if atom.nlocal == 0:
+        if atom.nlocal == 0 or self.setup_pending:
             return
         self.save_state_kernel(atom.nlocal)
 
@@ -140,3 +148,44 @@ class ContactHistory:
             nlist.num_neighbors,
             nlist.neighbors,
         )
+        self.setup_pending = False
+
+    def load_restart(
+        self,
+        partner_tags: list[np.ndarray],
+        values: list[np.ndarray],
+    ) -> None:
+        """
+        Seed the save buffers from a restart file, keyed by partner tag.
+
+        This is the counterpart of FixNeighHistory::unpack_restart: the values
+        land in the neighbor-data structures, and the first neighbor build of
+        the run (setup_post_neighbor) puts them onto the list.  Entry `k` of
+        the lists belongs to local atom `k`, i.e. the file order in which the
+        atoms were handed to AtomSystem.add_particles().
+
+        LAMMPS stores each contact on both partners, the second copy negated
+        (FixNeighHistory::pre_exchange_no_newton).  An entry found under atom
+        `i` for partner `j` is therefore always in the i-to-j convention, which
+        is the one the pair kernels use for slot (i, j).
+        """
+        n = min(len(partner_tags), self.max_atoms)
+        tags = np.full((self.max_atoms, self.max_neighbors), -1, dtype=np.int32)
+        shear = np.zeros((self.max_atoms, self.max_neighbors, 3), dtype=np.float64)
+        count = np.zeros(self.max_atoms, dtype=np.int32)
+        for i in range(n):
+            t = np.asarray(partner_tags[i], dtype=np.int32)
+            v = np.asarray(values[i], dtype=np.float64)
+            m = len(t)
+            if m > self.max_neighbors:
+                raise ValueError(
+                    f"atom {i} has {m} stored contacts but the history only "
+                    f"has {self.max_neighbors} slots per atom"
+                )
+            tags[i, :m] = t
+            shear[i, :m, : v.shape[1]] = v[:, :3]
+            count[i] = m
+        self.save_tag.from_numpy(tags)
+        self.save_shear.from_numpy(shear)
+        self.save_count.from_numpy(count)
+        self.setup_pending = True

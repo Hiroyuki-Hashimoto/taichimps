@@ -188,6 +188,22 @@ class PairGranular(GranularPair):
         if self.tangential_id != TANGENTIAL_NONE:
             self._setup_tangential(tangential, tangential_coeffs or [])
 
+        # The pair_coeff arguments, verbatim.  A restart file stores the model
+        # by sub-model name and raw coefficients (GranularModel::write_restart),
+        # not by the derived stiffnesses above, so they have to be kept.  NULL
+        # is stored as the -1 sentinel LAMMPS uses.
+        self.submodels: dict[str, tuple[str, list[float]]] = {
+            "normal": (normal, [float(c) for c in normal_coeffs]),
+            "damping": (damping, []),
+            "tangential": (
+                tangential,
+                [-1.0 if c is None else float(c) for c in (tangential_coeffs or [])],
+            ),
+            "rolling": ("none", []),
+            "twisting": ("none", []),
+            "heat": ("none", []),
+        }
+
     def _damping_coefficient(self, normal: str) -> float:
         """The `damp` constant of the chosen damping sub-model (its init())."""
         if self.damping_id in (DAMPING_TSUJI, DAMPING_COEFF_RESTITUTION):

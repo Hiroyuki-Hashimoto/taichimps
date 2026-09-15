@@ -69,8 +69,33 @@ class Simulation:
         self.integrator: FixNVESphere | None = None
         self.fixes: list[Fix] = []
         self.dumps: list[tuple[DumpWriter, int]] = []
+        # `restart N file`: how often to write, the name (a `*` in it is
+        # replaced by the timestep, as in LAMMPS) and who does the writing.
+        self.restart_every = 0
+        self.restart_file: str | None = None
+        self.restart_writer: Any = None
+        # Whether Verlet::setup() has run for this system yet.  After
+        # read_restart the timestep is non-zero but the forces are not, so this
+        # cannot be inferred from the timestep.
+        self.setup_done = False
+        # `run <N> pre no` skips the setup; on by default, as in LAMMPS.
+        self.run_pre = True
         self.thermo_freq = thermo_freq
         self.computes = Computes(float_type=float_type)
+
+    def set_restart(self, every: int, path: str | None, writer: Any) -> None:
+        """Configure periodic restart output (`restart N file`)."""
+        self.restart_every = every
+        self.restart_file = path
+        self.restart_writer = writer
+
+    def write_restart_now(self) -> None:
+        """Write one periodic restart file for the current timestep."""
+        if self.restart_writer is None or not self.restart_file:
+            return
+        self.restart_writer(
+            self.restart_file.replace("*", str(self.timestep)), self.timestep
+        )
 
     def add_dump(self, dump: DumpWriter, freq: int = 100) -> None:
         """Add a dump writer at the specified frequency."""
@@ -94,7 +119,7 @@ class Simulation:
         elif self.integrator is fix:
             self.integrator = None
 
-    def reneighbor_if_needed(self) -> bool:
+    def reneighbor_if_needed(self, force: bool = False) -> bool:
         """
         Apply PBC, rebuild the neighbor list and carry contact history over,
         but only on steps where LAMMPS would reneighbor.
@@ -112,7 +137,7 @@ class Simulation:
         # A fix may demand a rebuild regardless of the displacement check: a
         # box flip leaves atoms outside the relabelled cell until they are
         # wrapped, and binning would place them wrongly in the meantime.
-        forced = False
+        forced = force
         for fix in self.fixes:
             if fix.force_reneighbor:
                 forced = True
@@ -137,11 +162,22 @@ class Simulation:
             self.integrator.setup(nsteps_total, self.dt)
 
     def init_simulation(self) -> None:
-        """Initialize forces for the first timestep if not already done."""
+        """
+        Verlet::setup(): rebuild the neighbor list and evaluate the forces at
+        the current state, without advancing any contact history.
+
+        LAMMPS does this at the start of *every* `run` command, not just the
+        first.  It matters: the setup force is what the first half-kick of the
+        next step uses, and it is evaluated with `history_update = 0`, so a run
+        split in two is not the same trajectory as one long run -- but a run
+        resumed from a restart is exactly the same as a second `run` command,
+        which is what makes a restart verifiable.
+        """
+        self.setup_done = True
         # Calculate initial forces if needed
         self.atom.clear_forces()
         if self.pair_style is not None:
-            self.reneighbor_if_needed()
+            self.reneighbor_if_needed(force=True)
             # LAMMPS sets shearupdate = 0 while update->setupflag is on, so the
             # setup force evaluation must not advance the shear history.
             self.pair_style.compute(
@@ -206,7 +242,7 @@ class Simulation:
         # fix deform putting box rates in domain->h_rate for `remap v` -- must
         # have done so before the setup forces are evaluated.
         self.setup_run(steps)
-        if self.timestep == 0:
+        if self.run_pre or not self.setup_done:
             self.init_simulation()
 
         intervals = []
@@ -233,6 +269,8 @@ class Simulation:
             for dump_writer, freq in self.dumps:
                 if self.timestep % freq == 0:
                     dump_writer.write_dump(self.timestep, self.domain, self.atom)
+            if self.restart_every and self.timestep % self.restart_every == 0:
+                self.write_restart_now()
 
             remaining -= chunk
 
@@ -253,12 +291,14 @@ class Simulation:
         for dump_writer, freq in self.dumps:
             if self.timestep % freq == 0:
                 dump_writer.write_dump(self.timestep, self.domain, self.atom)
+        if self.restart_every and self.timestep % self.restart_every == 0:
+            self.write_restart_now()
 
     def run(self, steps: int) -> None:
         """Run the simulation for a given number of steps."""
         # Fix::init() before Verlet::setup(), as in LAMMPS: see run_gpu().
         self.setup_run(steps)
-        if self.timestep == 0:
+        if self.run_pre or not self.setup_done:
             self.init_simulation()
         for _ in range(steps):
             self.step()
