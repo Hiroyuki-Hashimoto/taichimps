@@ -249,6 +249,6 @@ class FixWallGran(Fix):
         )
         self.elapsed += dt
 
-    def setup(self, nsteps_total: int = 0) -> None:
+    def setup(self, nsteps_total: int = 0, dt: float = 0.0) -> None:
         """Restart the clock the wall motion is referenced to."""
         self.elapsed = 0.0

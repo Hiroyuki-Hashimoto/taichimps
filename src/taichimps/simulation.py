@@ -132,9 +132,9 @@ class Simulation:
     def setup_run(self, nsteps_total: int) -> None:
         """Tell the fixes a run is starting and how long it is."""
         for fix in self.fixes:
-            fix.setup(nsteps_total)
+            fix.setup(nsteps_total, self.dt)
         if self.integrator is not None:
-            self.integrator.setup(nsteps_total)
+            self.integrator.setup(nsteps_total, self.dt)
 
     def init_simulation(self) -> None:
         """Initialize forces for the first timestep if not already done."""
@@ -201,9 +201,13 @@ class Simulation:
 
         If dumps or periodic I/O fixes exist, runs in sub-batches up to the next I/O interval.
         """
+        # Fix::init() runs before Verlet::setup() in LAMMPS, and the order
+        # matters: a fix that publishes state the force computation reads --
+        # fix deform putting box rates in domain->h_rate for `remap v` -- must
+        # have done so before the setup forces are evaluated.
+        self.setup_run(steps)
         if self.timestep == 0:
             self.init_simulation()
-        self.setup_run(steps)
 
         intervals = []
         for _, freq in self.dumps:
@@ -252,8 +256,9 @@ class Simulation:
 
     def run(self, steps: int) -> None:
         """Run the simulation for a given number of steps."""
+        # Fix::init() before Verlet::setup(), as in LAMMPS: see run_gpu().
+        self.setup_run(steps)
         if self.timestep == 0:
             self.init_simulation()
-        self.setup_run(steps)
         for _ in range(steps):
             self.step()

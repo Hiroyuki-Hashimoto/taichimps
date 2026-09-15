@@ -102,6 +102,38 @@ def _run_taichimps(x, radius, density, v, omega, axes, couple, steps, **kwargs):
     return np.array([float(domain.prd[d]) for d in range(3)])
 
 
+def _run_taichimps_state(cfg, axes, steps, remap="x"):
+    """Same as _run_taichimps but hands back the live Domain and AtomSystem."""
+    x, radius, density, v, omega = cfg
+    domain = Domain(
+        boxlo=[0.0, 0.0, 0.0], boxhi=[BOX, BOX, BOX], boundary=("p", "p", "p")
+    )
+    n = len(x)
+    atom = AtomSystem(max_atoms=n)
+    atom.add_particles(x=x, radius=radius, density=density, v=v, omega=omega)
+    neighbor = NeighborList(
+        domain=domain, max_atoms=n, max_neighbors_per_atom=64, skin=SKIN
+    )
+    neighbor.check = False
+    neighbor.every = 1
+    history = ContactHistory(max_atoms=n, max_neighbors=64)
+    pair = GranHookeHistory(
+        domain=domain, kn=KN, gamman=GAMMAN, kt=KT, gammat=GAMMAT, xmu=XMU, dampflag=1
+    )
+    sim = Simulation(
+        domain=domain, atom=atom, neighbor=neighbor, history=history, pair=pair, dt=DT
+    )
+    sim.add_fix(FixNVESphere(domain=domain))
+    sim.add_fix(
+        FixDeformPressure(
+            domain=domain, axes=axes, couple="none", max_rate=MAXRATE,
+            nevery=1, remap=remap,
+        )
+    )
+    sim.run(steps)
+    return domain, atom
+
+
 def _lammps_box(tmp_path, cfg, deform_line, steps):
     x, radius, density, v, omega = cfg
     run_lammps(
@@ -354,3 +386,54 @@ def test_wiggle_matches_lammps(tmp_path):
     expected = BOX + amplitude * np.sin(2.0 * np.pi * STEPS * DT / period)
     np.testing.assert_allclose(prd_ref[0], expected, rtol=1e-9)
     np.testing.assert_allclose(prd_got, prd_ref, rtol=1e-9)
+
+
+@pytestmark_lmp
+@pytest.mark.parametrize("steps", [1, 20])
+def test_remap_v_matches_lammps(tmp_path, steps):
+    """
+    `remap v`: coordinates are not remapped, crossing velocities are.
+
+    This is the one mode where domain->h_rate reaches the atoms, so it is also
+    the only place where the box-length-versus-strain-rate distinction in
+    h_rate is observable. Particles are given enough velocity that several of
+    them cross a boundary during the run, otherwise the correction never fires.
+    """
+    cfg = _config(seed=67)
+    x, radius, density, v, omega = cfg
+    # Large enough that atoms leave the box within the run.
+    v = v * 200.0
+    cfg = (x, radius, density, v, omega)
+
+    rate = -2.0e3
+    deform = (
+        f"fix 2 all deform/pressure 1 "
+        f"x pressure {PTARGET} {PGAIN} y pressure {PTARGET} {PGAIN} "
+        f"z erate {rate} units box remap v max/rate {MAXRATE}"
+    )
+    frames = run_lammps(
+        tmp_path / f"lmp_{steps}",
+        x=x, radius=radius, density=density, v=v, omega=omega,
+        boxlo=(0.0, 0.0, 0.0), boxhi=(BOX, BOX, BOX),
+        pair_style=f"gran/hooke/history {KN} {KT} {GAMMAN} {GAMMAT} {XMU} 1",
+        steps=steps, dt=DT, skin=SKIN, extra_fixes=deform,
+    )
+    ref = frames[-1]
+    v_ref = np.stack([ref["vx"], ref["vy"], ref["vz"]], axis=1)
+
+    axes = {
+        "x": {"style": "pressure", "ptarget": PTARGET, "pgain": PGAIN},
+        "y": {"style": "pressure", "ptarget": PTARGET, "pgain": PGAIN},
+        "z": {"style": "erate", "rate": rate},
+    }
+    domain, atom = _run_taichimps_state(cfg, axes, steps, remap="v")
+    n = atom.nlocal
+    v_got = atom.v.to_numpy()[:n]
+
+    box = parse_box(tmp_path / f"lmp_{steps}" / "dump.out")[-1]
+    np.testing.assert_allclose(
+        [float(domain.prd[d]) for d in range(3)], box[:, 1] - box[:, 0], rtol=1e-9
+    )
+    scale = np.abs(v_ref).max()
+    assert scale > 0.0
+    np.testing.assert_allclose(v_got, v_ref, rtol=1e-9, atol=1e-9 * scale)

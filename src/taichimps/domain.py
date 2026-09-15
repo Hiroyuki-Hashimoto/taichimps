@@ -61,6 +61,11 @@ class Domain:
         self.tilt_f = ti.Vector.field(3, dtype=float_type, shape=())
         self.hinv_tilt_f = ti.Vector.field(3, dtype=float_type, shape=())
         self.triclinic_f = ti.field(dtype=ti.i32, shape=())
+        # Rate of change of the box, in LAMMPS's h_rate ordering
+        # [xprd, yprd, zprd, yz, xz, xy] -- box *length* rates, not strain
+        # rates. Only used when a deforming fix asks for `remap v`.
+        self.h_rate_f = ti.Vector.field(6, dtype=float_type, shape=())
+        self.vremap_f = ti.field(dtype=ti.i32, shape=())
 
         # Host-side mirrors, kept in step by set_box()/set_tilt()/set_boundary().
         self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
@@ -73,6 +78,9 @@ class Domain:
         self.tilt = np.zeros(3, dtype=np.float64)
         if tilt is not None:
             self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+        # [xprd, yprd, zprd, yz, xz, xy] rates; set by a deforming fix.
+        self.h_rate = np.zeros(6, dtype=np.float64)
+        self.vremap = False
         self._sync()
 
     # ------------------------------------------------------------------ state
@@ -112,6 +120,8 @@ class Domain:
         self.prd_f[None] = ti.Vector(self.prd.tolist())
         self.periodicity_f[None] = ti.Vector(self.periodicity.tolist())
         self.tilt_f[None] = ti.Vector([xy, xz, yz])
+        self.h_rate_f[None] = ti.Vector(self.h_rate.tolist())
+        self.vremap_f[None] = 1 if self.vremap else 0
         self.hinv_tilt_f[None] = ti.Vector([hinv_xy, hinv_xz, hinv_yz])
         self.triclinic_f[None] = 1 if self.triclinic else 0
 
@@ -142,6 +152,20 @@ class Domain:
     def set_tilt(self, tilt: list[float] | tuple[float, float, float]) -> None:
         """Update the [xy, xz, yz] tilt factors."""
         self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+        self._sync()
+
+    def set_h_rate(self, h_rate: Any, vremap: bool) -> None:
+        """
+        Record how fast the box is changing, for `remap v`.
+
+        LAMMPS keeps this in domain->h_rate and Domain::pbc() uses it to adjust
+        the velocity of an atom that crosses a periodic boundary, so the atom
+        arrives on the far side with the velocity the deforming lattice implies.
+        The units are a box length (or tilt) per unit time, not a strain rate --
+        that distinction is the subject of a LAMMPS bug this project reported.
+        """
+        self.h_rate = np.asarray(h_rate, dtype=np.float64)
+        self.vremap = bool(vremap)
         self._sync()
 
     def set_boundary(self, boundary: list[str] | tuple[str, str, str]) -> None:
@@ -210,6 +234,82 @@ class Domain:
         ])
 
     @ti.func
+    def minimum_image_and_vshift(self, dx):
+        """
+        Minimum image of a separation, plus the partner's velocity shift.
+
+        Under `remap v` a periodic image of an atom moves with the deforming
+        lattice, so a contact that reaches across a boundary sees a partner
+        whose velocity is offset by the box rate.  LAMMPS gets this for free:
+        AtomVec::pack_comm_vel() adds `pbc . h_rate` to a ghost's velocity when
+        deform_vremap is set.  taichimps has no ghosts, so the shift has to be
+        applied here, to the same image count the minimum image convention just
+        used.  Without it the damping force on every boundary-spanning contact
+        is wrong, which is exactly the coupling the upstream h_rate bug report
+        describes.
+
+        Returns (reduced separation, velocity to ADD to the partner).
+        """
+        n = self.image_offsets(dx)
+        dv = ti.Vector([0.0, 0.0, 0.0])
+        if self.vremap_f[None] != 0:
+            h = self.h_rate_f[None]
+            dv = ti.Vector([
+                n[0] * h[0] + n[1] * h[5] + n[2] * h[4],
+                n[1] * h[1] + n[2] * h[3],
+                n[2] * h[2],
+            ])
+        return self.apply_image_offsets(dx, n), dv
+
+    @ti.func
+    def image_offsets(self, dx):
+        """
+        Image counts the minimum image convention removes from a separation.
+
+        Reduced one lattice vector at a time in LAMMPS's order -- z first
+        (correcting y and x by yz and xz), then y correcting x by xy, then x --
+        because each correction has to use the *rounded* image count of the
+        previous direction.
+        """
+        prd = self.prd_f[None]
+        per = self.periodicity_f[None]
+        n = ti.Vector([0.0, 0.0, 0.0])
+        if self.triclinic_f[None] == 0:
+            for dim in ti.static(range(3)):
+                if per[dim] == 1:
+                    n[dim] = ti.round(dx[dim] / prd[dim])
+        else:
+            t = self.tilt_f[None]  # [xy, xz, yz]
+            d = dx
+            if per[2] == 1:
+                n[2] = ti.round(d[2] / prd[2])
+                d[2] -= n[2] * prd[2]
+                d[1] -= n[2] * t[2]
+                d[0] -= n[2] * t[1]
+            if per[1] == 1:
+                n[1] = ti.round(d[1] / prd[1])
+                d[1] -= n[1] * prd[1]
+                d[0] -= n[1] * t[0]
+            if per[0] == 1:
+                n[0] = ti.round(d[0] / prd[0])
+        return n
+
+    @ti.func
+    def apply_image_offsets(self, dx, n):
+        """Subtract `n` lattice vectors from a separation."""
+        prd = self.prd_f[None]
+        t = self.tilt_f[None]  # [xy, xz, yz]
+        out = dx
+        if self.triclinic_f[None] == 0:
+            for dim in ti.static(range(3)):
+                out[dim] -= n[dim] * prd[dim]
+        else:
+            out[2] -= n[2] * prd[2]
+            out[1] -= n[2] * t[2] + n[1] * prd[1]
+            out[0] -= n[2] * t[1] + n[1] * t[0] + n[0] * prd[0]
+        return out
+
+    @ti.func
     def minimum_image(self, dx):
         """
         Apply the minimum image convention.
@@ -248,6 +348,17 @@ class Domain:
         return dx
 
     @ti.func
+    def image_count(self, x):
+        """How many box lengths, per lattice direction, the point is out by."""
+        lamda = self.to_lamda(x - self.boxlo_f[None])
+        per = self.periodicity_f[None]
+        n = ti.Vector([0.0, 0.0, 0.0])
+        for dim in ti.static(range(3)):
+            if per[dim] == 1:
+                n[dim] = ti.floor(lamda[dim])
+        return n
+
+    @ti.func
     def pbc_wrap(self, x):
         """
         Wrap coordinates into the box, as LAMMPS Domain::pbc() does.
@@ -272,6 +383,24 @@ class Domain:
         return x
 
     @ti.func
+    def vremap_delta(self, n):
+        """
+        Velocity correction for an atom that moved `n` box lengths, for remap v.
+
+        Domain::pbc() applies, per crossing: leaving through x adjusts vx by
+        h_rate[0]; through y, vx by h_rate[5] (the xy tilt rate) and vy by
+        h_rate[1]; through z, vx by h_rate[4], vy by h_rate[3] and vz by
+        h_rate[2]. Signs follow the direction of the crossing, which `n` already
+        carries, and a multi-period jump scales with it.
+        """
+        h = self.h_rate_f[None]
+        return -ti.Vector([
+            n[0] * h[0] + n[1] * h[5] + n[2] * h[4],
+            n[1] * h[1] + n[2] * h[3],
+            n[2] * h[2],
+        ])
+
+    @ti.func
     def lamda_of(self, x):
         """Absolute position in lamda coordinates: h_inv . (x - boxlo)."""
         return self.to_lamda(x - self.boxlo_f[None])
@@ -281,6 +410,23 @@ class Domain:
         for i in range(nlocal):
             x[i] = self.pbc_wrap(x[i])
 
+    @ti.kernel
+    def _pbc_vremap_kernel(self, nlocal: ti.i32, x: ti.template(), v: ti.template()):
+        for i in range(nlocal):
+            n = self.image_count(x[i])
+            if n[0] != 0.0 or n[1] != 0.0 or n[2] != 0.0:
+                v[i] += self.vremap_delta(n)
+            x[i] = self.pbc_wrap(x[i])
+
     def pbc(self, atom: Any) -> None:
-        """Apply periodic boundary conditions to all atom positions."""
-        self._pbc_kernel(atom.nlocal, atom.x)
+        """
+        Apply periodic boundary conditions to all atom positions.
+
+        Under `remap v` the velocity of a crossing atom is corrected by the box
+        deformation rate, which is the only way the deformation reaches the
+        atoms in that mode -- their coordinates are not remapped affinely.
+        """
+        if self.vremap:
+            self._pbc_vremap_kernel(atom.nlocal, atom.x, atom.v)
+        else:
+            self._pbc_kernel(atom.nlocal, atom.x)

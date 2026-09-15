@@ -93,7 +93,7 @@ class GranHertzHistory(GranularPair):
                 mj = rmass[j]
                 oj = omega[j]
 
-                dpos = self.domain.minimum_image(xi - xj)
+                dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
                 rsq = dpos.dot(dpos)
                 radsum = ri + rj
 
@@ -106,9 +106,12 @@ class GranHertzHistory(GranularPair):
 
                     rsqinv = 1.0 / rsq
                     rinv = 1.0 / r
-                    vnnr = (vi - vj).dot(dpos)
+                    # Under `remap v` the periodic image of j moves with the
+                    # deforming lattice, so its velocity is offset.
+                    vrel_t = vi - (vj + dvj)
+                    vnnr = vrel_t.dot(dpos)
                     vn_vec = dpos * (vnnr * rsqinv)
-                    vt_vec = (vi - vj) - vn_vec
+                    vt_vec = vrel_t - vn_vec
                     wr = (ri * oi + rj * oj) * rinv
                     # LAMMPS: vtr1 = vt1 - (delz*wr2 - dely*wr3), i.e. vt - W x n.
                     # dpos.cross(wr) = n x W = -(W x n), hence the plus sign.

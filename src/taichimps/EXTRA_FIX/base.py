@@ -27,14 +27,14 @@ class Fix(ABC):
         # `next_reneighbor`.
         self.force_reneighbor = False
 
-    def setup(self, nsteps_total: int = 0) -> None:
+    def setup(self, nsteps_total: int = 0, dt: float = 0.0) -> None:
         """
         Called once at the start of a run, the analogue of LAMMPS Fix::init().
 
         Fixes that reference the state of the system at the start of a run
         (fix deform latching the box, for instance) latch it here, and those
         that interpolate towards a target at the end of the run get the run
-        length they need.
+        length and the timestep they need.
         """
 
     def initial_integrate(self, atom: AtomSystem, dt: float) -> None:

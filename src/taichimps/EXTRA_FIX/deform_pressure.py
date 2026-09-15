@@ -21,6 +21,12 @@ Implemented styles
     box       volume | pressure
     keywords  couple, max/rate, normalize/pressure, vol/balance/p, remap, nevery
 
+`remap x` (the default) moves the atoms affinely with the box.  `remap v`
+instead leaves coordinates alone and corrects the velocity of an atom that
+crosses a periodic boundary by the box deformation rate, which is carried in
+Domain.h_rate; the deformation then reaches the assembly through contacts
+rather than through an imposed displacement field.
+
 Not implemented: `erate/rescale` (it exists for NEMD with fix nvt/sllod, which
 taichimps does not have) and `units lattice` (there is no lattice command).
 Both raise rather than being silently ignored.
@@ -157,8 +163,8 @@ class FixDeformPressure(Fix):
 
         if couple not in COUPLE_CHOICES:
             raise ValueError(f"couple must be one of {COUPLE_CHOICES}, got {couple!r}")
-        if remap not in ("x", "none"):
-            raise ValueError("remap must be 'x' or 'none' ('v' is not implemented)")
+        if remap not in ("x", "v", "none"):
+            raise ValueError("remap must be 'x', 'v' or 'none'")
         self.couple = couple
         self.remap = remap
         self.flip = bool(flip)
@@ -350,7 +356,7 @@ class FixDeformPressure(Fix):
                     "vol/balance/p needs two dimensions holding the volume constant"
                 )
 
-    def setup(self, nsteps_total: int = 0) -> None:
+    def setup(self, nsteps_total: int = 0, dt: float = 0.0) -> None:
         """
         Latch the box at the start of a run, the way FixDeform::init() does.
 
@@ -385,6 +391,56 @@ class FixDeformPressure(Fix):
                     f"fix deform/pressure style {s.style!r} needs the run length; "
                     "call setup(nsteps_total) before running"
                 )
+
+        # FixDeform::init() fills h_rate for the strain styles before the run
+        # starts, so `remap v` already has a rate to apply at the very first
+        # boundary wrap. Leaving it at zero until the first end_of_step makes
+        # the first step disagree with LAMMPS.
+        self.domain.set_h_rate(self._strain_h_rate(dt), vremap=(self.remap == "v"))
+
+    def _strain_h_rate(self, dt: float) -> np.ndarray:
+        """
+        Analytic box-length rates of the strain styles, as FixDeform::init().
+
+        Pressure- and volume-controlled entries contribute nothing here; their
+        rate only exists once a pressure has been measured.
+        """
+        h = np.zeros(6)
+        delt = self.nsteps_total * dt
+        for i in range(3):
+            s = self.sets[i]
+            length = s.hi_start - s.lo_start
+            if s.style in ("erate", "trate"):
+                h[i] = s.rate * length
+            elif s.style == "vel":
+                h[i] = s.vel
+            elif s.style == "wiggle":
+                h[i] = 2.0 * math.pi / s.tperiod * s.amplitude
+            elif s.style in NEEDS_RUN_LENGTH and delt > 0.0:
+                if s.style == "final":
+                    stop = s.fhi - s.flo
+                elif s.style == "delta":
+                    stop = length + s.dhi - s.dlo
+                else:
+                    stop = s.scale * length
+                h[i] = (stop - length) / delt
+        # h_rate order past the diagonal is [yz, xz, xy]
+        for slot, idx in ((3, IYZ), (4, IXZ), (5, IXY)):
+            s = self.sets[idx]
+            b = IY if idx == IXY else IZ
+            lb = self.sets[b].hi_start - self.sets[b].lo_start
+            if s.style == "erate":
+                h[slot] = s.rate * lb
+            elif s.style == "trate":
+                h[slot] = s.rate * s.tilt_start
+            elif s.style == "vel":
+                h[slot] = s.vel
+            elif s.style == "wiggle":
+                h[slot] = 2.0 * math.pi / s.tperiod * s.amplitude
+            elif s.style in ("final", "delta") and delt > 0.0:
+                stop = s.ftilt if s.style == "final" else s.tilt_start + s.dtilt
+                h[slot] = (stop - s.tilt_start) / delt
+        return h
 
     # ------------------------------------------------------------------ kernel
 
@@ -847,6 +903,19 @@ class FixDeformPressure(Fix):
                 s.prior_rate = (
                     (s.hi_target - s.lo_target) / old_prd[i] - 1.0
                 ) / dt
+
+        # LAMMPS keeps domain->h_rate as box length (and tilt) rates, not strain
+        # rates; `remap v` reads it when wrapping an atom across a boundary.
+        # For every style whose target is linear in time this finite difference
+        # is exactly the rate LAMMPS stores analytically; `trate` differs only
+        # at O(rate*dt).
+        h_rate = np.zeros(6)
+        h_rate[:3] = (new_prd - old_prd) / dt
+        # h_rate order past the diagonal is [yz, xz, xy]; new_tilt is [xy, xz, yz]
+        h_rate[3] = (new_tilt[2] - old_tilt[2]) / dt
+        h_rate[4] = (new_tilt[1] - old_tilt[1]) / dt
+        h_rate[5] = (new_tilt[0] - old_tilt[0]) / dt
+        self.domain.set_h_rate(h_rate, vremap=(self.remap == "v"))
 
         if self.remap == "x" and atom.nlocal > 0:
             xprd, yprd, zprd = old_prd

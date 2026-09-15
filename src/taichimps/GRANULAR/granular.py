@@ -298,7 +298,7 @@ class PairGranular(GranularPair):
 
                 rj = radius[j]
                 radsum = ri + rj
-                dpos = self.domain.minimum_image(xi - x[j])
+                dpos, dvj = self.domain.minimum_image_and_vshift(xi - x[j])
                 rsq = dpos.dot(dpos)
 
                 if rsq < radsum * radsum and rsq > 1e-28:
@@ -311,7 +311,9 @@ class PairGranular(GranularPair):
                     # contact_radius = sqrt(dR), dR = delta * Reff
                     a = ti.sqrt(delta * reff)
 
-                    vr = vi - v[j]
+                    # Under `remap v` the periodic image of j moves with the
+                    # deforming lattice, so its velocity is offset.
+                    vr = vi - (v[j] + dvj)
                     vnnr = vr.dot(n)
                     vt = vr - vnnr * n
                     wr = ri * oi + rj * omega[j]

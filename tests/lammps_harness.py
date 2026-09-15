@@ -17,7 +17,12 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_LMP = Path("/mnt/s_work/hsmt/lammps/build-cpu/lmp")
+# Two builds sit next to this checkout. build-cpu predates the fix deform/
+# pressure h_rate corrections this project reported upstream; build-cpu-hratefix
+# is built from the current source tree, which is what taichimps was ported
+# from, so that is the one to compare against.
+DEFAULT_LMP = Path("/mnt/s_work/hsmt/lammps/build-cpu-hratefix/lmp")
+FALLBACK_LMP = Path("/mnt/s_work/hsmt/lammps/build-cpu/lmp")
 
 DUMP_FIELDS = [
     "id", "x", "y", "z",
@@ -34,8 +39,9 @@ def lmp_executable() -> Path | None:
     if env:
         p = Path(env)
         return p if p.is_file() and os.access(p, os.X_OK) else None
-    if DEFAULT_LMP.is_file() and os.access(DEFAULT_LMP, os.X_OK):
-        return DEFAULT_LMP
+    for candidate in (DEFAULT_LMP, FALLBACK_LMP):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     found = shutil.which("lmp") or shutil.which("lmp_serial")
     return Path(found) if found else None
 
