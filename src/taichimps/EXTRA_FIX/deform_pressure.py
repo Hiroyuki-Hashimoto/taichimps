@@ -532,14 +532,20 @@ class FixDeformPressure(Fix):
     def _apply_strain(self, dt: float) -> None:
         """Set targets for the strain-controlled dimensions and tilt factors."""
         assert self.domain is not None
+        # `self` is a @ti.data_oriented object, so every attribute access on it
+        # goes through Taichi's __getattribute__ hook -- about 0.7 us each, and
+        # this runs every step. Bind what the loops need to locals first.
+        dom = self.domain
+        sets = self.sets
         elapsed = self.nsteps * dt
         frac = self.nsteps / self.nsteps_total if self.nsteps_total > 0 else 0.0
+        boxlo, boxhi, dom_tilt = dom.boxlo, dom.boxhi, dom.tilt
 
         for i in range(3):
-            s = self.sets[i]
+            s = sets[i]
             if s.style == "none":
-                s.lo_target = float(self.domain.boxlo[i])
-                s.hi_target = float(self.domain.boxhi[i])
+                s.lo_target = float(boxlo[i])
+                s.hi_target = float(boxhi[i])
             elif s.style == "trate":
                 # True strain rate: L(t) = L0 * exp(rate * t)
                 mid = 0.5 * (s.lo_start + s.hi_start)
@@ -575,13 +581,13 @@ class FixDeformPressure(Fix):
         # Tilt factors, in LAMMPS's order: xy first, then yz, then xz, since xz
         # depends on the xy rate and the yz tilt.
         for i in (IXY, IYZ, IXZ):
-            s = self.sets[i]
+            s = sets[i]
             # `b` is the dimension the shear rate is measured against: y for xy,
             # z for xz and yz.
             b = IY if i == IXY else IZ
-            lb_start = self.sets[b].hi_start - self.sets[b].lo_start
+            lb_start = sets[b].hi_start - sets[b].lo_start
             if s.style == "none":
-                s.tilt_target = float(self.domain.tilt[TILT_TO_DOMAIN[i]])
+                s.tilt_target = float(dom_tilt[TILT_TO_DOMAIN[i]])
             elif s.style == "trate":
                 s.tilt_target = s.tilt_start * math.exp(s.rate * elapsed)
             elif s.style == "erate":
@@ -601,23 +607,26 @@ class FixDeformPressure(Fix):
     def _apply_pressure(self, p_current: np.ndarray, dt: float) -> None:
         """Proportional servo on the pressure-controlled entries."""
         assert self.domain is not None
+        sets = self.sets
+        prd = self.domain.prd
+        limit = self._limit_rate
         for i in range(3):
-            s = self.sets[i]
+            s = sets[i]
             if s.style not in PRESSURE_STYLES:
                 continue
-            rate = self._limit_rate(s.pgain * (p_current[i] - s.ptarget), s.ptarget)
+            rate = limit(s.pgain * (p_current[i] - s.ptarget), s.ptarget)
             # h_rate is a rate of change of box length, not a strain rate
-            s.cumulative_shift += dt * rate * float(self.domain.prd[i])
+            s.cumulative_shift += dt * rate * float(prd[i])
             s.lo_target = s.lo_start - 0.5 * s.cumulative_shift
             s.hi_target = s.hi_start + 0.5 * s.cumulative_shift
 
         for i in (IYZ, IXZ, IXY):
-            s = self.sets[i]
+            s = sets[i]
             if s.style != "pressure":
                 continue
             # yz and xz shear across z, xy across y.
-            length = float(self.domain.prd[1 if i == IXY else 2])
-            rate = self._limit_rate(s.pgain * (p_current[i] - s.ptarget), s.ptarget)
+            length = float(prd[1 if i == IXY else 2])
+            rate = limit(s.pgain * (p_current[i] - s.ptarget), s.ptarget)
             s.cumulative_shift += dt * rate * length
             s.tilt_target = s.tilt_start + s.cumulative_shift
 
@@ -787,14 +796,16 @@ class FixDeformPressure(Fix):
         happens there puts everything back inside the relabelled cell.
         """
         assert self.domain is not None
-        new_lo = np.array([self.sets[i].lo_target for i in range(3)])
-        new_hi = np.array([self.sets[i].hi_target for i in range(3)])
+        dom = self.domain
+        sets = self.sets
+        new_lo = np.array([sets[i].lo_target for i in range(3)])
+        new_hi = np.array([sets[i].hi_target for i in range(3)])
         # Domain order [xy, xz, yz]
         tilt = np.array(
-            [self.sets[IXY].tilt_target, self.sets[IXZ].tilt_target,
-             self.sets[IYZ].tilt_target]
+            [sets[IXY].tilt_target, sets[IXZ].tilt_target, sets[IYZ].tilt_target]
         )
-        cur = self.domain.tilt
+        cur = dom.tilt
+        dom_prd = dom.prd
         prd = new_hi - new_lo
 
         # Reduce each target to the equivalent nearest the current value. xy and
@@ -803,7 +814,7 @@ class FixDeformPressure(Fix):
             denom = prd[1] if set_i == IYZ else prd[0]
             if denom <= 0.0:
                 continue
-            current = cur[dom_i] / (self.domain.prd[1 if set_i == IYZ else 0])
+            current = cur[dom_i] / dom_prd[1 if set_i == IYZ else 0]
             n = round(tilt[dom_i] / denom - current)
             if n != 0:
                 tilt[dom_i] -= n * denom
@@ -820,7 +831,7 @@ class FixDeformPressure(Fix):
                 or abs(tilt[0]) > 0.5 * prd[0]   # xy vs xprd
             )
             if over:
-                if self.domain.pbc_y:
+                if dom.pbc_y:
                     if tilt[2] < -0.5 * prd[1]:
                         tilt[2] += prd[1]
                         tilt[1] += tilt[0]
@@ -829,7 +840,7 @@ class FixDeformPressure(Fix):
                         tilt[2] -= prd[1]
                         tilt[1] -= tilt[0]
                         flipped = True
-                if self.domain.pbc_x:
+                if dom.pbc_x:
                     if tilt[1] < -0.5 * prd[0]:
                         tilt[1] += prd[0]
                         flipped = True
@@ -858,8 +869,14 @@ class FixDeformPressure(Fix):
         if self.step_count % self.nevery != 0:
             return
 
+        # Bound to locals for the same reason as in _apply_strain: attribute
+        # access on a @ti.data_oriented object is not free, and this is the
+        # per-step path.
+        dom = self.domain
+        sets = self.sets
+
         needs_pressure = (
-            any(s.style in PRESSURE_STYLES for s in self.sets)
+            any(s.style in PRESSURE_STYLES for s in sets)
             or self.set_box.style == "pressure"
             or self.vol_balance_p
         )
@@ -868,16 +885,16 @@ class FixDeformPressure(Fix):
         if needs_pressure:
             p_current, tensor = self._current_pressure(atom)
             for i in range(3):
-                s = self.sets[i]
+                s = sets[i]
                 s.pressure_now = float(tensor[i])  # type: ignore[attr-defined]
                 if not s.saved:
                     s.saved = True
                     s.prior_rate = 0.0
                     s.prior_pressure = float(tensor[i])
 
-        old_prd = np.array([float(self.domain.prd[d]) for d in range(3)])
-        old_lo = np.array([float(self.domain.boxlo[d]) for d in range(3)])
-        old_tilt = self.domain.tilt.copy()
+        old_prd = dom.prd.copy()
+        old_lo = dom.boxlo.copy()
+        old_tilt = dom.tilt.copy()
 
         self._apply_strain(dt)
         if needs_pressure:
@@ -898,7 +915,7 @@ class FixDeformPressure(Fix):
         if needs_pressure:
             # Remember this step's response for the next vol/balance/p update.
             for i in range(3):
-                s = self.sets[i]
+                s = sets[i]
                 s.prior_pressure = float(tensor[i])
                 s.prior_rate = (
                     (s.hi_target - s.lo_target) / old_prd[i] - 1.0
@@ -935,7 +952,7 @@ class FixDeformPressure(Fix):
             self._new_tilt[None] = ti.Vector(deformed_tilt.tolist())
             self.remap_positions(atom.nlocal, atom.x)
 
-        self.domain.set_box_and_h_rate(
+        dom.set_box_and_h_rate(
             new_lo.tolist(), new_hi.tolist(), new_tilt.tolist(),
             h_rate, vremap=(self.remap == "v"),
         )

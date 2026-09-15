@@ -8,11 +8,6 @@ from typing import Any
 import numpy as np
 import taichi as ti
 
-# Layout of the Domain._sync staging buffer:
-#   0-2 boxlo, 3-5 boxhi, 6-8 tilt, 9-11 periodicity,
-#   12-17 h_rate, 18 vremap, 19 triclinic
-_STAGE_LEN = 20
-
 
 @ti.data_oriented
 class Domain:
@@ -72,15 +67,6 @@ class Domain:
         self.h_rate_f = ti.Vector.field(6, dtype=float_type, shape=())
         self.vremap_f = ti.field(dtype=ti.i32, shape=())
 
-        # Staging buffer for _sync(). Writing the nine fields above one at a
-        # time costs nine host-to-device round trips; a deforming run does that
-        # twice per step (set_box and set_h_rate), which measured at 0.64 ms per
-        # step on CUDA -- more than three times the cost of the contact force
-        # kernel itself. One transfer into this buffer plus one kernel that
-        # unpacks it on the device does the same job for a quarter of that.
-        self._stage = ti.field(dtype=float_type, shape=_STAGE_LEN)
-        self._stage_host = np.zeros(_STAGE_LEN, dtype=np.float64)
-
         # Host-side mirrors, kept in step by set_box()/set_tilt()/set_boundary().
         self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
         self.boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
@@ -117,30 +103,40 @@ class Domain:
         return float(self.tilt[2])
 
     @ti.kernel
-    def _unpack_stage(self):
+    def _sync_kernel(
+        self,
+        lo0: ti.f64, lo1: ti.f64, lo2: ti.f64,
+        hi0: ti.f64, hi1: ti.f64, hi2: ti.f64,
+        xy: ti.f64, xz: ti.f64, yz: ti.f64,
+        r0: ti.f64, r1: ti.f64, r2: ti.f64,
+        r3: ti.f64, r4: ti.f64, r5: ti.f64,
+        per0: ti.i32, per1: ti.i32, per2: ti.i32,
+        vremap: ti.i32, triclinic: ti.i32,
+    ):
         """
-        Spread the staging buffer over the fields the kernels actually read.
+        Publish the box to the fields the kernels read, in one launch.
 
-        prd and the off-diagonals of h_inv are derived here rather than sent,
-        so the host only ships the box itself.
+        The values arrive as kernel arguments rather than through a field.
+        That is not a detail: writing the nine fields below one at a time is
+        nine separate host-to-device round trips, which measured at 322 us on
+        CUDA, and even staging them through one field and unpacking it costs
+        87 us against 51 us for arguments.  A deforming run does this every
+        step, so it sat alongside the contact force kernel in the profile.
+
+        prd and the off-diagonals of h_inv are derived here rather than sent.
         """
-        st = ti.static(self._stage)
-        lo = ti.Vector([st[0], st[1], st[2]])
-        hi = ti.Vector([st[3], st[4], st[5]])
-        xy, xz, yz = st[6], st[7], st[8]
+        lo = ti.Vector([lo0, lo1, lo2])
+        hi = ti.Vector([hi0, hi1, hi2])
+        prd = hi - lo
 
         self.boxlo_f[None] = lo
         self.boxhi_f[None] = hi
-        prd = hi - lo
         self.prd_f[None] = prd
         self.tilt_f[None] = ti.Vector([xy, xz, yz])
-        self.periodicity_f[None] = ti.Vector([
-            ti.cast(st[9], ti.i32), ti.cast(st[10], ti.i32), ti.cast(st[11], ti.i32)
-        ])
-        self.h_rate_f[None] = ti.Vector([st[12], st[13], st[14],
-                                         st[15], st[16], st[17]])
-        self.vremap_f[None] = ti.cast(st[18], ti.i32)
-        self.triclinic_f[None] = ti.cast(st[19], ti.i32)
+        self.periodicity_f[None] = ti.Vector([per0, per1, per2])
+        self.h_rate_f[None] = ti.Vector([r0, r1, r2, r3, r4, r5])
+        self.vremap_f[None] = vremap
+        self.triclinic_f[None] = triclinic
 
         # Domain::set_global_box(): h = [xprd, yprd, zprd, yz, xz, xy]
         #   h_inv[3] = -yz / (yprd*zprd)
@@ -154,17 +150,19 @@ class Domain:
         ])
 
     def _sync(self) -> None:
-        """Push the host-side box onto the device, in a single transfer."""
-        st = self._stage_host
-        st[0:3] = self.boxlo
-        st[3:6] = self.boxhi
-        st[6:9] = self.tilt
-        st[9:12] = self.periodicity
-        st[12:18] = self.h_rate
-        st[18] = 1.0 if self.vremap else 0.0
-        st[19] = 1.0 if self.triclinic else 0.0
-        self._stage.from_numpy(st)
-        self._unpack_stage()
+        """Push the host-side box onto the device, in a single kernel launch."""
+        lo, hi, t, r, p = (
+            self.boxlo, self.boxhi, self.tilt, self.h_rate, self.periodicity
+        )
+        self._sync_kernel(
+            lo[0], lo[1], lo[2],
+            hi[0], hi[1], hi[2],
+            t[0], t[1], t[2],
+            r[0], r[1], r[2], r[3], r[4], r[5],
+            int(p[0]), int(p[1]), int(p[2]),
+            1 if self.vremap else 0,
+            1 if self.triclinic else 0,
+        )
 
     @property
     def volume(self) -> float:
