@@ -67,21 +67,104 @@ class Domain:
         self.h_rate_f = ti.Vector.field(6, dtype=float_type, shape=())
         self.vremap_f = ti.field(dtype=ti.i32, shape=())
 
-        # Host-side mirrors, kept in step by set_box()/set_tilt()/set_boundary().
-        self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
-        self.boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
-        self.prd = self.boxhi - self.boxlo
-        self.periodicity = np.array(
+        # Host-side mirrors. Read them through the properties below, never
+        # through these attributes: the properties are what notices that the
+        # device has moved on and the mirror is out of date.
+        self._boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
+        self._boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
+        self._prd = self._boxhi - self._boxlo
+        self._periodicity = np.array(
             [1 if b == "p" else 0 for b in boundary], dtype=np.int32
         )
         # [xy, xz, yz], matching the LAMMPS data-file ordering.
-        self.tilt = np.zeros(3, dtype=np.float64)
+        self._tilt = np.zeros(3, dtype=np.float64)
         if tilt is not None:
-            self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+            self._tilt = np.array([float(v) for v in tilt], dtype=np.float64)
         # [xprd, yprd, zprd, yz, xz, xy] rates; set by a deforming fix.
-        self.h_rate = np.zeros(6, dtype=np.float64)
+        self._h_rate = np.zeros(6, dtype=np.float64)
         self.vremap = False
+        # Set once the device has changed the box without telling the host --
+        # see mark_device_authoritative().
+        self._host_stale = False
         self._sync()
+
+    # ------------------------------------------------- host / device ownership
+
+    def mark_device_authoritative(self) -> None:
+        """
+        Say that a kernel has changed the box, so the host mirror is out of date.
+
+        This is a plain Python flag: nothing is read from the device, so calling
+        it costs nothing.  The host does not have to ask whether the box
+        changed, because it is the host that launched the kernel that changed
+        it.
+        """
+        self._host_stale = True
+
+    def pull(self) -> None:
+        """
+        Bring the host mirror back in step with the device.
+
+        This is the expensive direction -- the host has to wait for every
+        kernel it has queued to finish before the values can be read, which
+        measured at around 80 us.  That is why it is an explicit call rather
+        than something the properties below do for you: a read that silently
+        synchronised would be correct but would quietly cost 80 us every time
+        it ran, and a single such read on the per-step path would undo the
+        whole point of moving the box onto the device.  The neighbour list's
+        displacement check was exactly that kind of innocent-looking per-step
+        read, and it cost 0.48 ms per step until it was found.
+
+        Call it where the host genuinely needs the box: before a neighbour
+        rebuild, and on output steps.
+        """
+        if not self._host_stale:
+            return
+        self._boxlo = np.asarray(self.boxlo_f.to_numpy(), dtype=np.float64).reshape(3)
+        self._boxhi = np.asarray(self.boxhi_f.to_numpy(), dtype=np.float64).reshape(3)
+        self._tilt = np.asarray(self.tilt_f.to_numpy(), dtype=np.float64).reshape(3)
+        self._h_rate = np.asarray(self.h_rate_f.to_numpy(), dtype=np.float64).reshape(6)
+        self._prd = self._boxhi - self._boxlo
+        self._host_stale = False
+
+    def _fresh(self, name: str):
+        if self._host_stale:
+            raise RuntimeError(
+                f"Domain.{name} was read while the device holds the current box. "
+                "Call domain.pull() first, at a point where synchronising with "
+                "the device is acceptable -- not on the per-step path."
+            )
+
+    @property
+    def boxlo(self) -> np.ndarray:
+        self._fresh("boxlo")
+        return self._boxlo
+
+    @property
+    def boxhi(self) -> np.ndarray:
+        self._fresh("boxhi")
+        return self._boxhi
+
+    @property
+    def prd(self) -> np.ndarray:
+        self._fresh("prd")
+        return self._prd
+
+    @property
+    def tilt(self) -> np.ndarray:
+        self._fresh("tilt")
+        return self._tilt
+
+    @property
+    def h_rate(self) -> np.ndarray:
+        self._fresh("h_rate")
+        return self._h_rate
+
+    @property
+    def periodicity(self) -> np.ndarray:
+        # Boundary conditions are set from the script and never by a kernel,
+        # so this one is always the host's to answer.
+        return self._periodicity
 
     # ------------------------------------------------------------------ state
 
@@ -150,9 +233,15 @@ class Domain:
         ])
 
     def _sync(self) -> None:
-        """Push the host-side box onto the device, in a single kernel launch."""
+        """
+        Push the host-side box onto the device, in a single kernel launch.
+
+        This makes the two agree, so whatever the device had is superseded and
+        the mirror is current again.
+        """
+        self._host_stale = False
         lo, hi, t, r, p = (
-            self.boxlo, self.boxhi, self.tilt, self.h_rate, self.periodicity
+            self._boxlo, self._boxhi, self._tilt, self._h_rate, self._periodicity
         )
         self._sync_kernel(
             lo[0], lo[1], lo[2],
@@ -172,7 +261,8 @@ class Domain:
         det(h) = xprd * yprd * zprd for a restricted triclinic box too, since h
         is triangular: tilting shears the cell without changing its volume.
         """
-        return float(self.prd[0] * self.prd[1] * self.prd[2])
+        prd = self.prd
+        return float(prd[0] * prd[1] * prd[2])
 
     def set_box(
         self,
@@ -181,16 +271,16 @@ class Domain:
         tilt: list[float] | tuple[float, float, float] | None = None,
     ) -> None:
         """Update domain bounds (and optionally tilt), on the host and device."""
-        self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
-        self.boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
-        self.prd = self.boxhi - self.boxlo
+        self._boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
+        self._boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
+        self._prd = self._boxhi - self._boxlo
         if tilt is not None:
-            self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+            self._tilt = np.array([float(v) for v in tilt], dtype=np.float64)
         self._sync()
 
     def set_tilt(self, tilt: list[float] | tuple[float, float, float]) -> None:
         """Update the [xy, xz, yz] tilt factors."""
-        self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+        self._tilt = np.array([float(v) for v in tilt], dtype=np.float64)
         self._sync()
 
     def set_box_and_h_rate(
@@ -207,12 +297,12 @@ class Domain:
         A deforming fix updates both every step; doing it as set_box() followed
         by set_h_rate() syncs the device twice for no reason.
         """
-        self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
-        self.boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
-        self.prd = self.boxhi - self.boxlo
+        self._boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
+        self._boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
+        self._prd = self._boxhi - self._boxlo
         if tilt is not None:
-            self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
-        self.h_rate = np.asarray(h_rate, dtype=np.float64)
+            self._tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+        self._h_rate = np.asarray(h_rate, dtype=np.float64)
         self.vremap = bool(vremap)
         self._sync()
 
@@ -226,13 +316,13 @@ class Domain:
         The units are a box length (or tilt) per unit time, not a strain rate --
         that distinction is the subject of a LAMMPS bug this project reported.
         """
-        self.h_rate = np.asarray(h_rate, dtype=np.float64)
+        self._h_rate = np.asarray(h_rate, dtype=np.float64)
         self.vremap = bool(vremap)
         self._sync()
 
     def set_boundary(self, boundary: list[str] | tuple[str, str, str]) -> None:
         """Update boundary periodicity."""
-        self.periodicity = np.array(
+        self._periodicity = np.array(
             [1 if b == "p" else 0 for b in boundary], dtype=np.int32
         )
         self._sync()
@@ -244,9 +334,9 @@ class Domain:
         This is LAMMPS's boxlo_bound/boxhi_bound, which is what a dump file
         reports for a triclinic box.
         """
-        xy, xz, yz = (float(v) for v in self.tilt)
-        lo = self.boxlo.copy()
-        hi = self.boxhi.copy()
+        xy, xz, yz = (float(v) for v in self._tilt)
+        lo = self._boxlo.copy()
+        hi = self._boxhi.copy()
         lo[0] = min(lo[0], lo[0] + xy, lo[0] + xz, lo[0] + xy + xz)
         hi[0] = max(hi[0], hi[0] + xy, hi[0] + xz, hi[0] + xy + xz)
         lo[1] = min(lo[1], lo[1] + yz)
@@ -255,15 +345,15 @@ class Domain:
 
     @property
     def pbc_x(self) -> bool:
-        return bool(self.periodicity[0])
+        return bool(self._periodicity[0])
 
     @property
     def pbc_y(self) -> bool:
-        return bool(self.periodicity[1])
+        return bool(self._periodicity[1])
 
     @property
     def pbc_z(self) -> bool:
-        return bool(self.periodicity[2])
+        return bool(self._periodicity[2])
 
     # ----------------------------------------------------------- device funcs
 
