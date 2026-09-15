@@ -54,7 +54,9 @@ class NeighborList:
 
         # Displacement check for skin / neigh_modify
         self.x0 = ti.Vector.field(3, dtype=float_type, shape=max_atoms)
-        self.max_displacement_sq = ti.field(dtype=float_type, shape=())
+        # Set by check_displacement() when some particle has moved more than
+        # half the skin since the list was built.
+        self.need_rebuild = ti.field(dtype=ti.i32, shape=())
 
         # Parameters for neigh_modify (LAMMPS default: delay 0 every 1 check yes)
         self.delay: int = 0
@@ -183,13 +185,26 @@ class NeighborList:
             self.x0[i] = x[i]
 
     @ti.kernel
-    def check_displacement(self, nlocal: ti.i32, x: ti.template()):
-        """Find max displacement squared among all local particles relative to x0."""
-        self.max_displacement_sq[None] = 0.0
+    def check_displacement(self, nlocal: ti.i32, x: ti.template(), trigger_sq: ti.f64):
+        """
+        Has any particle moved more than half the skin since the list was built?
+
+        The answer is a flag, not the maximum displacement, and that is the
+        whole point.  Reducing to a maximum means every thread does an
+        atomic_max on one global f64, and CUDA has no native f64 atomic maximum,
+        so it is emulated with a compare-and-swap loop that 1400 threads then
+        contend on.  That cost 0.48 ms per step on the 1400-particle FCC case --
+        two and a half times the contact force kernel.
+
+        Testing each particle against the threshold instead means the common
+        answer, "nobody has", writes nothing at all: no atomic is executed, and
+        the pass is a plain streaming read.
+        """
+        self.need_rebuild[None] = 0
         for i in range(nlocal):
             diff = x[i] - self.x0[i]
-            dsq = diff.dot(diff)
-            ti.atomic_max(self.max_displacement_sq[None], dsq)
+            if diff.dot(diff) > trigger_sq:
+                self.need_rebuild[None] = 1
 
     @ti.kernel
     def build_grid(self, nlocal: ti.i32, x: ti.template()):
@@ -323,10 +338,8 @@ class NeighborList:
         if atom.nlocal == 0:
             return False
 
-        self.check_displacement(atom.nlocal, atom.x)
-        max_dsq = float(self.max_displacement_sq[None])
-        trigger_sq = 0.25 * self.skin * self.skin
-        return max_dsq > trigger_sq
+        self.check_displacement(atom.nlocal, atom.x, 0.25 * self.skin * self.skin)
+        return bool(self.need_rebuild[None])
 
     def check_and_build(
         self, atom: AtomSystem, timestep: int | None = None
