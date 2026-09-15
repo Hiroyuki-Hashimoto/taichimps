@@ -915,8 +915,9 @@ class FixDeformPressure(Fix):
         h_rate[3] = (new_tilt[2] - old_tilt[2]) / dt
         h_rate[4] = (new_tilt[1] - old_tilt[1]) / dt
         h_rate[5] = (new_tilt[0] - old_tilt[0]) / dt
-        self.domain.set_h_rate(h_rate, vremap=(self.remap == "v"))
 
+        # The box itself is published below, after the `remap x` pass: that
+        # pass reads the box out of Domain and needs to see the old one.
         if self.remap == "x" and atom.nlocal > 0:
             xprd, yprd, zprd = old_prd
             oxy, oxz, oyz = old_tilt
@@ -934,7 +935,10 @@ class FixDeformPressure(Fix):
             self._new_tilt[None] = ti.Vector(deformed_tilt.tolist())
             self.remap_positions(atom.nlocal, atom.x)
 
-        self.domain.set_box(new_lo.tolist(), new_hi.tolist(), tilt=new_tilt.tolist())
+        self.domain.set_box_and_h_rate(
+            new_lo.tolist(), new_hi.tolist(), new_tilt.tolist(),
+            h_rate, vremap=(self.remap == "v"),
+        )
         if flipped:
             # Atoms now sit outside the relabelled cell until they are wrapped.
             self.force_reneighbor = True

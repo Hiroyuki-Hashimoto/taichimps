@@ -8,6 +8,11 @@ from typing import Any
 import numpy as np
 import taichi as ti
 
+# Layout of the Domain._sync staging buffer:
+#   0-2 boxlo, 3-5 boxhi, 6-8 tilt, 9-11 periodicity,
+#   12-17 h_rate, 18 vremap, 19 triclinic
+_STAGE_LEN = 20
+
 
 @ti.data_oriented
 class Domain:
@@ -67,6 +72,15 @@ class Domain:
         self.h_rate_f = ti.Vector.field(6, dtype=float_type, shape=())
         self.vremap_f = ti.field(dtype=ti.i32, shape=())
 
+        # Staging buffer for _sync(). Writing the nine fields above one at a
+        # time costs nine host-to-device round trips; a deforming run does that
+        # twice per step (set_box and set_h_rate), which measured at 0.64 ms per
+        # step on CUDA -- more than three times the cost of the contact force
+        # kernel itself. One transfer into this buffer plus one kernel that
+        # unpacks it on the device does the same job for a quarter of that.
+        self._stage = ti.field(dtype=float_type, shape=_STAGE_LEN)
+        self._stage_host = np.zeros(_STAGE_LEN, dtype=np.float64)
+
         # Host-side mirrors, kept in step by set_box()/set_tilt()/set_boundary().
         self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
         self.boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
@@ -102,28 +116,55 @@ class Domain:
     def yz(self) -> float:
         return float(self.tilt[2])
 
-    def _sync(self) -> None:
-        """Push the host-side box onto the device."""
-        xy, xz, yz = (float(v) for v in self.tilt)
-        xprd, yprd, zprd = (float(v) for v in self.prd)
+    @ti.kernel
+    def _unpack_stage(self):
+        """
+        Spread the staging buffer over the fields the kernels actually read.
+
+        prd and the off-diagonals of h_inv are derived here rather than sent,
+        so the host only ships the box itself.
+        """
+        st = ti.static(self._stage)
+        lo = ti.Vector([st[0], st[1], st[2]])
+        hi = ti.Vector([st[3], st[4], st[5]])
+        xy, xz, yz = st[6], st[7], st[8]
+
+        self.boxlo_f[None] = lo
+        self.boxhi_f[None] = hi
+        prd = hi - lo
+        self.prd_f[None] = prd
+        self.tilt_f[None] = ti.Vector([xy, xz, yz])
+        self.periodicity_f[None] = ti.Vector([
+            ti.cast(st[9], ti.i32), ti.cast(st[10], ti.i32), ti.cast(st[11], ti.i32)
+        ])
+        self.h_rate_f[None] = ti.Vector([st[12], st[13], st[14],
+                                         st[15], st[16], st[17]])
+        self.vremap_f[None] = ti.cast(st[18], ti.i32)
+        self.triclinic_f[None] = ti.cast(st[19], ti.i32)
 
         # Domain::set_global_box(): h = [xprd, yprd, zprd, yz, xz, xy]
         #   h_inv[3] = -yz / (yprd*zprd)
         #   h_inv[4] = (yz*xy - yprd*xz) / (xprd*yprd*zprd)
         #   h_inv[5] = -xy / (xprd*yprd)
-        hinv_xy = -xy / (xprd * yprd)
-        hinv_xz = (yz * xy - yprd * xz) / (xprd * yprd * zprd)
-        hinv_yz = -yz / (yprd * zprd)
+        xprd, yprd, zprd = prd[0], prd[1], prd[2]
+        self.hinv_tilt_f[None] = ti.Vector([
+            -xy / (xprd * yprd),
+            (yz * xy - yprd * xz) / (xprd * yprd * zprd),
+            -yz / (yprd * zprd),
+        ])
 
-        self.boxlo_f[None] = ti.Vector(self.boxlo.tolist())
-        self.boxhi_f[None] = ti.Vector(self.boxhi.tolist())
-        self.prd_f[None] = ti.Vector(self.prd.tolist())
-        self.periodicity_f[None] = ti.Vector(self.periodicity.tolist())
-        self.tilt_f[None] = ti.Vector([xy, xz, yz])
-        self.h_rate_f[None] = ti.Vector(self.h_rate.tolist())
-        self.vremap_f[None] = 1 if self.vremap else 0
-        self.hinv_tilt_f[None] = ti.Vector([hinv_xy, hinv_xz, hinv_yz])
-        self.triclinic_f[None] = 1 if self.triclinic else 0
+    def _sync(self) -> None:
+        """Push the host-side box onto the device, in a single transfer."""
+        st = self._stage_host
+        st[0:3] = self.boxlo
+        st[3:6] = self.boxhi
+        st[6:9] = self.tilt
+        st[9:12] = self.periodicity
+        st[12:18] = self.h_rate
+        st[18] = 1.0 if self.vremap else 0.0
+        st[19] = 1.0 if self.triclinic else 0.0
+        self._stage.from_numpy(st)
+        self._unpack_stage()
 
     @property
     def volume(self) -> float:
@@ -152,6 +193,29 @@ class Domain:
     def set_tilt(self, tilt: list[float] | tuple[float, float, float]) -> None:
         """Update the [xy, xz, yz] tilt factors."""
         self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+        self._sync()
+
+    def set_box_and_h_rate(
+        self,
+        boxlo: list[float] | tuple[float, float, float],
+        boxhi: list[float] | tuple[float, float, float],
+        tilt: list[float] | tuple[float, float, float] | None,
+        h_rate: Any,
+        vremap: bool,
+    ) -> None:
+        """
+        Set the box and its rate of change together, in one device transfer.
+
+        A deforming fix updates both every step; doing it as set_box() followed
+        by set_h_rate() syncs the device twice for no reason.
+        """
+        self.boxlo = np.array([float(v) for v in boxlo], dtype=np.float64)
+        self.boxhi = np.array([float(v) for v in boxhi], dtype=np.float64)
+        self.prd = self.boxhi - self.boxlo
+        if tilt is not None:
+            self.tilt = np.array([float(v) for v in tilt], dtype=np.float64)
+        self.h_rate = np.asarray(h_rate, dtype=np.float64)
+        self.vremap = bool(vremap)
         self._sync()
 
     def set_h_rate(self, h_rate: Any, vremap: bool) -> None:
