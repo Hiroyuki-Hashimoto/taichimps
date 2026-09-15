@@ -199,9 +199,22 @@ class AtomSystem:
         return self.nlocal
 
     @ti.kernel
-    def clear_forces(self):
-        """Zero out forces, torques and virial at start of timestep."""
-        for i in range(self.nlocal):
+    def _clear_forces_kernel(self, nlocal: ti.template()):
+        for i in range(nlocal):
             self.f[i] = ti.Vector([0.0, 0.0, 0.0])
             self.torque[i] = ti.Vector([0.0, 0.0, 0.0])
             self.virial[i] = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    def clear_forces(self) -> None:
+        """
+        Zero out forces, torques and virial at start of timestep.
+
+        The count goes in as a template argument rather than being read off
+        `self` inside the kernel.  Reading `self.nlocal` there looks equivalent
+        and is not: it is a plain Python int, so Taichi bakes it in when the
+        kernel is first compiled and never looks again, and any later
+        add_particles() or filter_particles() would leave this clearing the
+        wrong number of atoms.  A template argument is baked in too, but Taichi
+        recompiles per distinct value, so it tracks the count.
+        """
+        self._clear_forces_kernel(self.nlocal)

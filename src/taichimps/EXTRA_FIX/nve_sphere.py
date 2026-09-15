@@ -43,7 +43,7 @@ class FixNVESphere(Fix):
     @ti.kernel
     def initial_integrate_kernel(
         self,
-        nlocal: ti.i32,
+        nlocal: ti.template(),
         dt: ti.template(),
         x: ti.template(),
         v: ti.template(),
@@ -53,10 +53,16 @@ class FixNVESphere(Fix):
         radius: ti.template(),
         rmass: ti.template(),
     ):
-        dtv = dt
-        dtf = 0.5 * dt
-
+        # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
+        # not passed at launch. A loop whose bound is a runtime argument makes
+        # Taichi emit a second, serial GPU launch ahead of the parallel one
+        # just to establish the range; measured at 6.9 us per call on CUDA,
+        # which at this system size is a third of the kernel's own cost.
+        # Taichi recompiles per distinct value, so a run whose particle count
+        # never changes compiles this once.
         for i in range(nlocal):
+            dtv = dt
+            dtf = 0.5 * dt
             m = rmass[i]
             r = radius[i]
             # Moment of inertia for solid sphere: I = 2/5 * m * r^2
@@ -78,7 +84,7 @@ class FixNVESphere(Fix):
     @ti.kernel
     def final_integrate_kernel(
         self,
-        nlocal: ti.i32,
+        nlocal: ti.template(),
         dt: ti.template(),
         v: ti.template(),
         f: ti.template(),
@@ -87,9 +93,9 @@ class FixNVESphere(Fix):
         radius: ti.template(),
         rmass: ti.template(),
     ):
-        dtf = 0.5 * dt
-
+        # See initial_integrate_kernel for why nlocal is a template.
         for i in range(nlocal):
+            dtf = 0.5 * dt
             m = rmass[i]
             r = radius[i]
             inertia = 0.4 * m * r * r

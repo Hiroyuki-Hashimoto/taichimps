@@ -28,7 +28,7 @@ class Computes:
     @ti.kernel
     def compute_ke_kernel(
         self,
-        nlocal: ti.i32,
+        nlocal: ti.template(),
         v: ti.template(),
         omega: ti.template(),
         radius: ti.template(),
@@ -47,7 +47,7 @@ class Computes:
     @ti.kernel
     def compute_virial_kernel(
         self,
-        nlocal: ti.i32,
+        nlocal: ti.template(),
         v: ti.template(),
         rmass: ti.template(),
         atom_virial: ti.template(),
@@ -63,6 +63,13 @@ class Computes:
         -- is not translation invariant under periodic boundaries, because
         taichimps has no ghost atoms to unwrap against.
         """
+        # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
+        # not passed at launch. A loop whose bound is a runtime argument makes
+        # Taichi emit a second, serial GPU launch ahead of the parallel one
+        # just to establish the range; measured at 6.9 us per call on CUDA,
+        # which at this system size is a third of the kernel's own cost.
+        # Taichi recompiles per distinct value, so a run whose particle count
+        # never changes compiles this once.
         for k in ti.static(range(6)):
             self.virial_tensor[k] = 0.0
 

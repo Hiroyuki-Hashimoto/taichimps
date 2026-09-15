@@ -282,7 +282,7 @@ class PairGranular(GranularPair):
     @ti.kernel
     def compute_kernel(
         self,
-        nlocal: ti.i32,
+        nlocal: ti.template(),
         dt: ti.template(),
         history_update: ti.i32,
         x: ti.template(),
@@ -299,6 +299,13 @@ class PairGranular(GranularPair):
         shear_hist: ti.template(),
         partner_hist: ti.template(),
     ):
+        # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
+        # not passed at launch. A loop whose bound is a runtime argument makes
+        # Taichi emit a second, serial GPU launch ahead of the parallel one
+        # just to establish the range; measured at 6.9 us per call on CUDA,
+        # which at this system size is a third of the kernel's own cost.
+        # Taichi recompiles per distinct value, so a run whose particle count
+        # never changes compiles this once.
         for i in range(nlocal):
             xi = x[i]
             vi = v[i]

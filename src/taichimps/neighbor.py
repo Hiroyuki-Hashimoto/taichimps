@@ -54,9 +54,19 @@ class NeighborList:
 
         # Displacement check for skin / neigh_modify
         self.x0 = ti.Vector.field(3, dtype=float_type, shape=max_atoms)
-        # Set by check_displacement() when some particle has moved more than
-        # half the skin since the list was built.
+        # check_displacement() stamps this with the call's own serial number
+        # when some particle has moved more than half the skin since the list
+        # was built; decide() then asks whether the stamp is the current one.
+        #
+        # A stamp rather than a zero-then-set flag, because zeroing it would be
+        # a scalar statement at kernel scope, and Taichi compiles those into a
+        # *second*, serial GPU launch that runs before the parallel loop. At
+        # this system size such a launch costs more than the work it carries.
+        # Stamping needs no initialisation: every writer writes the same value,
+        # so the race is benign, and a stale stamp can never equal the current
+        # one because the counter only goes up.
         self.need_rebuild = ti.field(dtype=ti.i32, shape=())
+        self._check_stamp: int = 0
 
         # Parameters for neigh_modify (LAMMPS default: delay 0 every 1 check yes)
         self.delay: int = 0
@@ -179,17 +189,20 @@ class NeighborList:
         return ti.Vector([cx, cy, cz])
 
     @ti.kernel
-    def store_x0(self, nlocal: ti.i32, x: ti.template()):
+    def store_x0(self, nlocal: ti.template(), x: ti.template()):
         """Store reference particle positions for displacement checking."""
         for i in range(nlocal):
             self.x0[i] = x[i]
 
     @ti.kernel
-    def check_displacement(self, nlocal: ti.i32, x: ti.template(), trigger_sq: ti.f64):
+    def check_displacement(
+        self, nlocal: ti.template(), x: ti.template(),
+        trigger_sq: ti.f64, stamp: ti.i32,
+    ):
         """
         Has any particle moved more than half the skin since the list was built?
 
-        The answer is a flag, not the maximum displacement, and that is the
+        The answer is a stamp, not the maximum displacement, and that is the
         whole point.  Reducing to a maximum means every thread does an
         atomic_max on one global f64, and CUDA has no native f64 atomic maximum,
         so it is emulated with a compare-and-swap loop that 1400 threads then
@@ -198,16 +211,24 @@ class NeighborList:
 
         Testing each particle against the threshold instead means the common
         answer, "nobody has", writes nothing at all: no atomic is executed, and
-        the pass is a plain streaming read.
+        the pass is a plain streaming read.  Writing this call's stamp rather
+        than a 1 avoids having to clear the field first, which would cost a
+        whole extra GPU launch (see the field's definition).
         """
-        self.need_rebuild[None] = 0
+        # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
+        # not passed at launch. A loop whose bound is a runtime argument makes
+        # Taichi emit a second, serial GPU launch ahead of the parallel one
+        # just to establish the range; measured at 6.9 us per call on CUDA,
+        # which at this system size is a third of the kernel's own cost.
+        # Taichi recompiles per distinct value, so a run whose particle count
+        # never changes compiles this once.
         for i in range(nlocal):
             diff = x[i] - self.x0[i]
             if diff.dot(diff) > trigger_sq:
-                self.need_rebuild[None] = 1
+                self.need_rebuild[None] = stamp
 
     @ti.kernel
-    def build_grid(self, nlocal: ti.i32, x: ti.template()):
+    def build_grid(self, nlocal: ti.template(), x: ti.template()):
         """
         Bin the particles by counting sort: count, prefix sum, scatter.
 
@@ -246,7 +267,7 @@ class NeighborList:
     @ti.kernel
     def build_neighbor_list(
         self,
-        nlocal: ti.i32,
+        nlocal: ti.template(),
         x: ti.template(),
         radius: ti.template(),
     ):
@@ -338,8 +359,11 @@ class NeighborList:
         if atom.nlocal == 0:
             return False
 
-        self.check_displacement(atom.nlocal, atom.x, 0.25 * self.skin * self.skin)
-        return bool(self.need_rebuild[None])
+        self._check_stamp += 1
+        self.check_displacement(
+            atom.nlocal, atom.x, 0.25 * self.skin * self.skin, self._check_stamp
+        )
+        return int(self.need_rebuild[None]) == self._check_stamp
 
     def check_and_build(
         self, atom: AtomSystem, timestep: int | None = None
