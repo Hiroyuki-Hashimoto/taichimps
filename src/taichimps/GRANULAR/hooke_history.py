@@ -73,15 +73,7 @@ class GranHookeHistory(GranularPair):
         nlocal: ti.i32,
         dt: ti.template(),
         shearupdate: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
-        tag: ti.template(),
-        virial: ti.template(),
+        atom: ti.template(),
         npairs: ti.template(),
         pair_i: ti.template(),
         pair_j: ti.template(),
@@ -95,16 +87,16 @@ class GranHookeHistory(GranularPair):
         for nc in range(npairs[None]):
             i = pair_i[nc]
             j = pair_j[nc]
-            xi = x[i]
-            vi = v[i]
-            ri = radius[i]
-            mi = rmass[i]
-            oi = omega[i]
-            xj = x[j]
-            vj = v[j]
-            rj = radius[j]
-            mj = rmass[j]
-            oj = omega[j]
+            xi = atom.x[i]
+            vi = atom.v[i]
+            ri = atom.radius[i]
+            mi = atom.rmass[i]
+            oi = atom.omega[i]
+            xj = atom.x[j]
+            vj = atom.v[j]
+            rj = atom.radius[j]
+            mj = atom.rmass[j]
+            oj = atom.omega[j]
 
             # Distance and normal vector
             dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
@@ -145,7 +137,7 @@ class GranHookeHistory(GranularPair):
                     ccel = 0.0
 
                 # Tangential force (incremental shear history)
-                jtag = tag[j]
+                jtag = atom.tag[j]
                 shear = shear_hist[nc]
                 if partner_hist[nc] != jtag:
                     shear = ti.Vector([0.0, 0.0, 0.0])
@@ -179,12 +171,12 @@ class GranHookeHistory(GranularPair):
 
                 f_total = dpos * ccel + fs_vec
 
-                ti.atomic_add(f[i], f_total)
-                ti.atomic_add(f[j], -f_total)
+                ti.atomic_add(atom.f[i], f_total)
+                ti.atomic_add(atom.f[j], -f_total)
 
                 tor = rinv * dpos.cross(fs_vec)
-                ti.atomic_add(torque[i], -ri * tor)
-                ti.atomic_add(torque[j], -rj * tor)
+                ti.atomic_add(atom.torque[i], -ri * tor)
+                ti.atomic_add(atom.torque[j], -rj * tor)
 
                 # Pairwise virial, as in Pair::ev_tally_xyz()
                 vir = 0.5 * ti.Vector([
@@ -195,8 +187,8 @@ class GranHookeHistory(GranularPair):
                     dpos[0] * f_total[2],
                     dpos[1] * f_total[2],
                 ])
-                ti.atomic_add(virial[i], vir)
-                ti.atomic_add(virial[j], vir)
+                ti.atomic_add(atom.virial[i], vir)
+                ti.atomic_add(atom.virial[j], vir)
             else:
                 # Not in contact: clear history
                 partner_hist[nc] = -1
@@ -216,15 +208,7 @@ class GranHookeHistory(GranularPair):
             atom.nlocal,
             dt,
             1 if shearupdate else 0,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
-            atom.tag,
-            atom.virial,
+            atom,
             nlist.npairs,
             nlist.pair_i,
             nlist.pair_j,

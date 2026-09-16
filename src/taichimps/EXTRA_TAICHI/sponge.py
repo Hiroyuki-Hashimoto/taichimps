@@ -60,10 +60,7 @@ class WinSponge(Fix):
     def sponge_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
         boxlo_x: ti.template(),
         boxlo_y: ti.template(),
         boxlo_z: ti.template(),
@@ -81,9 +78,9 @@ class WinSponge(Fix):
         flag_zhi: ti.i32,
     ):
         for i in range(nlocal):
-            px = x[i][0]
-            py = x[i][1]
-            pz = x[i][2]
+            px = atom.x[i][0]
+            py = atom.x[i][1]
+            pz = atom.x[i][2]
 
             max_d_norm = 0.0
 
@@ -129,12 +126,12 @@ class WinSponge(Fix):
             if max_d_norm > 0.0:
                 # Polynomial ramp: w = norm^power
                 w = max_d_norm**power
-                m = rmass[i]
+                m = atom.rmass[i]
                 coeff = eta_max * w * m
 
-                f[i][0] -= coeff * v[i][0]
-                f[i][1] -= coeff * v[i][1]
-                f[i][2] -= coeff * v[i][2]
+                atom.f[i][0] -= coeff * atom.v[i][0]
+                atom.f[i][1] -= coeff * atom.v[i][1]
+                atom.f[i][2] -= coeff * atom.v[i][2]
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0 or self.domain is None:
@@ -142,10 +139,7 @@ class WinSponge(Fix):
 
         self.sponge_kernel(
             atom.nlocal,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.rmass,
+            atom,
             self.domain.boxlo[0],
             self.domain.boxlo[1],
             self.domain.boxlo[2],

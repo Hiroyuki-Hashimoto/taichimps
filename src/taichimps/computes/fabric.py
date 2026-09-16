@@ -25,8 +25,7 @@ class ComputeFabric:
     def compute_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        radius: ti.template(),
+        atom: ti.template(),
         num_neigh: ti.template(),
         neighbors: ti.template(),
         domain: ti.template(),
@@ -41,14 +40,14 @@ class ComputeFabric:
         n_c = 0
 
         for i in range(nlocal):
-            xi = x[i]
-            ri = radius[i]
+            xi = atom.x[i]
+            ri = atom.radius[i]
             n_i = num_neigh[i]
             for k in range(n_i):
                 j = neighbors[i, k]
                 if j > i:
-                    xj = x[j]
-                    rj = radius[j]
+                    xj = atom.x[j]
+                    rj = atom.radius[j]
                     # Delegate the minimum image to Domain so a tilted cell is
                     # handled the same way here as in the pair styles; the
                     # hand-rolled per-axis version this replaced had no tilt
@@ -88,8 +87,7 @@ class ComputeFabric:
             return np.zeros(6, dtype=np.float64), 0
         self.compute_kernel(
             atom.nlocal,
-            atom.x,
-            atom.radius,
+            atom,
             neighbor.num_neighbors,
             neighbor.neighbors,
             domain,

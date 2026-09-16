@@ -45,13 +45,7 @@ class FixNVESphere(Fix):
         self,
         nlocal: ti.template(),
         dt: ti.template(),
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
     ):
         # `nlocal` is a ti.template(), i.e. baked into the compiled kernel,
         # not passed at launch. A loop whose bound is a runtime argument makes
@@ -63,48 +57,43 @@ class FixNVESphere(Fix):
         for i in range(nlocal):
             dtv = dt
             dtf = 0.5 * dt
-            m = rmass[i]
-            r = radius[i]
+            m = atom.rmass[i]
+            r = atom.radius[i]
             # Moment of inertia for solid sphere: I = 2/5 * m * r^2
             inertia = 0.4 * m * r * r
 
             # Update velocity half-step: v(t + dt/2) = v(t) + dtf * (f / m)
-            v[i] += dtf * (f[i] / m)
+            atom.v[i] += dtf * (atom.f[i] / m)
 
             # Update position full-step: x(t + dt) = x(t) + dtv * v(t + dt/2)
             # No PBC wrap here: LAMMPS remaps coordinates in Domain::pbc(),
             # which only runs on reneighboring steps.  Wrapping every step
             # would make the neighbor list's skin displacement check compare
             # positions from different periodic images.
-            x[i] = x[i] + dtv * v[i]
+            atom.x[i] = atom.x[i] + dtv * atom.v[i]
 
             # Update angular velocity half-step: omega(t + dt/2) = omega(t) + dtf * (torque / I)
-            omega[i] += dtf * (torque[i] / inertia)
+            atom.omega[i] += dtf * (atom.torque[i] / inertia)
 
     @ti.kernel
     def final_integrate_kernel(
         self,
         nlocal: ti.template(),
         dt: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
     ):
         # See initial_integrate_kernel for why nlocal is a template.
         for i in range(nlocal):
             dtf = 0.5 * dt
-            m = rmass[i]
-            r = radius[i]
+            m = atom.rmass[i]
+            r = atom.radius[i]
             inertia = 0.4 * m * r * r
 
             # Update velocity 2nd half-step: v(t + dt) = v(t + dt/2) + dtf * (f(t + dt) / m)
-            v[i] += dtf * (f[i] / m)
+            atom.v[i] += dtf * (atom.f[i] / m)
 
             # Update angular velocity 2nd half-step: omega(t + dt) = omega(t + dt/2) + dtf * (torque(t + dt) / I)
-            omega[i] += dtf * (torque[i] / inertia)
+            atom.omega[i] += dtf * (atom.torque[i] / inertia)
 
     def initial_integrate(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
@@ -112,13 +101,7 @@ class FixNVESphere(Fix):
         self.initial_integrate_kernel(
             atom.nlocal,
             dt,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
+            atom,
         )
 
     def final_integrate(self, atom: AtomSystem, dt: float) -> None:
@@ -127,10 +110,5 @@ class FixNVESphere(Fix):
         self.final_integrate_kernel(
             atom.nlocal,
             dt,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
+            atom,
         )

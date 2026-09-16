@@ -1089,7 +1089,7 @@ class FixDeformPressure(Fix):
         assert self.domain is not None
         if atom.nlocal:
             self.computes.compute_virial_kernel(
-                atom.nlocal, atom.v, atom.rmass, atom.virial, 1, self._chunks
+                atom.nlocal, atom, 1, self._chunks
             )
         self._servo_kernel(
             self.nsteps * dt,

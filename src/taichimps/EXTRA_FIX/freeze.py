@@ -22,18 +22,15 @@ class FixFreeze(Fix):
     def post_force_kernel(
         self,
         nlocal: ti.i32,
-        v: ti.template(),
-        omega: ti.template(),
-        f: ti.template(),
-        torque: ti.template(),
+        atom: ti.template(),
     ):
         for i in range(nlocal):
-            v[i] = ti.Vector([0.0, 0.0, 0.0])
-            omega[i] = ti.Vector([0.0, 0.0, 0.0])
-            f[i] = ti.Vector([0.0, 0.0, 0.0])
-            torque[i] = ti.Vector([0.0, 0.0, 0.0])
+            atom.v[i] = ti.Vector([0.0, 0.0, 0.0])
+            atom.omega[i] = ti.Vector([0.0, 0.0, 0.0])
+            atom.f[i] = ti.Vector([0.0, 0.0, 0.0])
+            atom.torque[i] = ti.Vector([0.0, 0.0, 0.0])
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
             return
-        self.post_force_kernel(atom.nlocal, atom.v, atom.omega, atom.f, atom.torque)
+        self.post_force_kernel(atom.nlocal, atom)

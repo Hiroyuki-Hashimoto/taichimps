@@ -129,13 +129,7 @@ class FixWallGran(Fix):
         vwall_n: ti.f64,
         vwall_s: ti.f64,
         history_update: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
     ):
         axis = ti.static(self.wall_axis)
         side = ti.static(self.wall_side)
@@ -151,9 +145,9 @@ class FixWallGran(Fix):
             vwall[shear_axis] = vwall_s
 
         for i in range(nlocal):
-            ri = radius[i]
+            ri = atom.radius[i]
             # Signed distance from the wall plane along the inward normal.
-            dist = (x[i][axis] - wall_coord) if side == -1 else (wall_coord - x[i][axis])
+            dist = (atom.x[i][axis] - wall_coord) if side == -1 else (wall_coord - atom.x[i][axis])
             delta = ri - dist
 
             if delta <= 0.0:
@@ -163,13 +157,13 @@ class FixWallGran(Fix):
                 continue
 
             # The wall has infinite mass, so the effective mass is the particle's.
-            meff = rmass[i]
+            meff = atom.rmass[i]
 
-            vr = v[i] - vwall
+            vr = atom.v[i] - vwall
             vnnr = vr.dot(n)
             vt = vr - vnnr * n
             # radj = 0, so W = radi * omega_i
-            wr = ri * omega[i]
+            wr = ri * atom.omega[i]
             vtr = vt - wr.cross(n)
             vrel = vtr.norm()
 
@@ -215,9 +209,9 @@ class FixWallGran(Fix):
                     ft = ti.min(fscrit, damp_t * vrel) / vrel
                 fs = -ft * vtr
 
-            f[i] += fntot * n + fs
+            atom.f[i] += fntot * n + fs
             # For a wall the moment arm is the full radius.
-            torque[i] += -ri * n.cross(fs)
+            atom.torque[i] += -ri * n.cross(fs)
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
@@ -239,13 +233,7 @@ class FixWallGran(Fix):
             vwall_n,
             self.shear_vel,
             1 if self.history_update else 0,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
+            atom,
         )
         self.elapsed += dt
 

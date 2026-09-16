@@ -558,17 +558,17 @@ class Domain:
         return self.to_lamda(x - self.boxlo_f[None])
 
     @ti.kernel
-    def _pbc_kernel(self, nlocal: ti.i32, x: ti.template()):
+    def _pbc_kernel(self, nlocal: ti.i32, atom: ti.template()):
         for i in range(nlocal):
-            x[i] = self.pbc_wrap(x[i])
+            atom.x[i] = self.pbc_wrap(atom.x[i])
 
     @ti.kernel
-    def _pbc_vremap_kernel(self, nlocal: ti.i32, x: ti.template(), v: ti.template()):
+    def _pbc_vremap_kernel(self, nlocal: ti.i32, atom: ti.template()):
         for i in range(nlocal):
-            n = self.image_count(x[i])
+            n = self.image_count(atom.x[i])
             if n[0] != 0.0 or n[1] != 0.0 or n[2] != 0.0:
-                v[i] += self.vremap_delta(n)
-            x[i] = self.pbc_wrap(x[i])
+                atom.v[i] += self.vremap_delta(n)
+            atom.x[i] = self.pbc_wrap(atom.x[i])
 
     def pbc(self, atom: Any) -> None:
         """
@@ -579,6 +579,6 @@ class Domain:
         atoms in that mode -- their coordinates are not remapped affinely.
         """
         if self.vremap:
-            self._pbc_vremap_kernel(atom.nlocal, atom.x, atom.v)
+            self._pbc_vremap_kernel(atom.nlocal, atom)
         else:
-            self._pbc_kernel(atom.nlocal, atom.x)
+            self._pbc_kernel(atom.nlocal, atom)

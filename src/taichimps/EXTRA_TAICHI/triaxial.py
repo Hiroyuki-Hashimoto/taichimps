@@ -52,7 +52,7 @@ class FixTriaxial(Fix):
         self.current_stress = np.zeros(3, dtype=np.float64)
 
     @ti.kernel
-    def remap_positions_kernel(self, nlocal: ti.i32, x: ti.template()):
+    def remap_positions_kernel(self, nlocal: ti.i32, atom: ti.template()):
         """
         Affine remap onto the new box: x_new = new_lo + (x - old_lo) * scale.
 
@@ -124,7 +124,7 @@ class FixTriaxial(Fix):
         )
         self._new_lo[None] = ti.Vector([float(v) for v in new_boxlo])
         self._scale[None] = ti.Vector([float(s) for s in scale])
-        self.remap_positions_kernel(atom.nlocal, atom.x)
+        self.remap_positions_kernel(atom.nlocal, atom)
 
         self.domain.set_box(new_boxlo, new_boxhi)
 

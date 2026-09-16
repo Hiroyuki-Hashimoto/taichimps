@@ -206,14 +206,14 @@ class NeighborList:
         return ti.Vector([cx, cy, cz])
 
     @ti.kernel
-    def store_x0(self, nlocal: ti.template(), x: ti.template()):
+    def store_x0(self, nlocal: ti.template(), atom: ti.template()):
         """Store reference particle positions for displacement checking."""
         for i in range(nlocal):
-            self.x0[i] = x[i]
+            self.x0[i] = atom.x[i]
 
     @ti.kernel
     def check_displacement(
-        self, nlocal: ti.template(), x: ti.template(),
+        self, nlocal: ti.template(), atom: ti.template(),
         trigger_sq: ti.f64, stamp: ti.i32,
     ):
         """
@@ -240,12 +240,12 @@ class NeighborList:
         # Taichi recompiles per distinct value, so a run whose particle count
         # never changes compiles this once.
         for i in range(nlocal):
-            diff = x[i] - self.x0[i]
+            diff = atom.x[i] - self.x0[i]
             if diff.dot(diff) > trigger_sq:
                 self.need_rebuild[None] = stamp
 
     @ti.kernel
-    def build_grid(self, nlocal: ti.template(), x: ti.template()):
+    def build_grid(self, nlocal: ti.template(), atom: ti.template()):
         """
         Bin the particles by counting sort: count, prefix sum, scatter.
 
@@ -262,7 +262,7 @@ class NeighborList:
             self.cell_count[c] = 0
 
         for i in range(nlocal):
-            cell = self.get_cell_coord(x[i])
+            cell = self.get_cell_coord(atom.x[i])
             c_idx = cell[0] + cell[1] * gx + cell[2] * gxy
             self.cell_of[i] = c_idx
             ti.atomic_add(self.cell_count[c_idx], 1)
@@ -306,8 +306,7 @@ class NeighborList:
     def build_neighbor_list(
         self,
         nlocal: ti.template(),
-        x: ti.template(),
-        radius: ti.template(),
+        atom: ti.template(),
     ):
         """
         Build neighbor list using spatial binning.
@@ -321,8 +320,8 @@ class NeighborList:
 
         for i in range(nlocal):
             self.num_neighbors[i] = 0
-            pos_i = x[i]
-            r_i = radius[i]
+            pos_i = atom.x[i]
+            r_i = atom.radius[i]
             cell_i = self.get_cell_coord(pos_i)
             cx, cy, cz = cell_i[0], cell_i[1], cell_i[2]
 
@@ -354,9 +353,9 @@ class NeighborList:
                     for p in range(self.cell_start[c_idx], self.cell_start[c_idx + 1]):
                         j = self.cell_particles[p]
                         if j > i:
-                            dpos = self.domain.minimum_image(pos_i - x[j])
+                            dpos = self.domain.minimum_image(pos_i - atom.x[j])
                             rsq = dpos.dot(dpos)
-                            rad_sum = r_i + radius[j] + self.skin
+                            rad_sum = r_i + atom.radius[j] + self.skin
                             if rsq < rad_sum * rad_sum:
                                 # Keep scanning even once full, so that the
                                 # overflow is detected rather than hidden by
@@ -399,7 +398,7 @@ class NeighborList:
 
         self._check_stamp += 1
         self.check_displacement(
-            atom.nlocal, atom.x, 0.25 * self.skin * self.skin, self._check_stamp
+            atom.nlocal, atom, 0.25 * self.skin * self.skin, self._check_stamp
         )
         return int(self.need_rebuild[None]) == self._check_stamp
 
@@ -420,9 +419,9 @@ class NeighborList:
         r_np = atom.radius.to_numpy()[: atom.nlocal]
         max_r = float(np.max(r_np)) if len(r_np) > 0 else 1.0
         self.setup_grid(2.0 * max_r)
-        self.build_grid(atom.nlocal, atom.x)
+        self.build_grid(atom.nlocal, atom)
         self.overflow[None] = 0
-        self.build_neighbor_list(atom.nlocal, atom.x, atom.radius)
+        self.build_neighbor_list(atom.nlocal, atom)
         self.build_pair_list(atom.nlocal)
         if self.overflow[None] != 0:
             raise RuntimeError(
@@ -430,7 +429,7 @@ class NeighborList:
                 f"{self.max_neighbors_per_atom} neighbors for at least one particle. "
                 "Increase max_neighbors_per_atom, or reduce the neighbor skin."
             )
-        self.store_x0(atom.nlocal, atom.x)
+        self.store_x0(atom.nlocal, atom)
         self.has_built = True
         self.build_count += 1
         self.last_build_step = self.current_step

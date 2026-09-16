@@ -71,18 +71,16 @@ class Visualizer3D:
     def _update_render_buffers(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        radius: ti.template(),
+        atom: ti.template(),
         color_by_speed: ti.i32,
         max_speed: ti.f32,
     ):
         for i in range(nlocal):
-            self.render_pos[i] = ti.cast(x[i], ti.f32)
-            self.render_radius[i] = ti.cast(radius[i], ti.f32)
+            self.render_pos[i] = ti.cast(atom.x[i], ti.f32)
+            self.render_radius[i] = ti.cast(atom.radius[i], ti.f32)
 
             if color_by_speed == 1:
-                vel = ti.cast(v[i], ti.f32)
+                vel = ti.cast(atom.v[i], ti.f32)
                 speed = vel.norm()
                 norm_speed = ti.min(1.0, speed / (max_speed + 1e-6))
 
@@ -133,9 +131,7 @@ class Visualizer3D:
         if n_render > 0:
             self._update_render_buffers(
                 n_render,
-                atom.x,
-                atom.v,
-                atom.radius,
+                atom,
                 color_flag,
                 float(max_speed),
             )

@@ -43,14 +43,13 @@ class FixGravity(Fix):
     def post_force_kernel(
         self,
         nlocal: ti.i32,
-        f: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
     ):
         for i in range(nlocal):
-            m = rmass[i]
-            f[i] += m * self.g
+            m = atom.rmass[i]
+            atom.f[i] += m * self.g
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
             return
-        self.post_force_kernel(atom.nlocal, atom.f, atom.rmass)
+        self.post_force_kernel(atom.nlocal, atom)

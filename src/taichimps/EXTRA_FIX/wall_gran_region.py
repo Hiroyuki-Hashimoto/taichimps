@@ -124,17 +124,11 @@ class FixWallGranRegion(Fix):
         axis_hi: ti.template(),
         is_hertz: ti.i32,
         history_update: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
     ):
         for i in range(nlocal):
-            pos = x[i]
-            r_i = radius[i]
+            pos = atom.x[i]
+            r_i = atom.radius[i]
 
             pos_axis = pos[axis]
             if has_axis_bounds == 1 and (pos_axis < axis_lo or pos_axis > axis_hi):
@@ -200,9 +194,9 @@ class FixWallGranRegion(Fix):
                     delta = r_i - (r_perp - radius_cyl)
 
                 if delta > 0.0:
-                    mi = rmass[i]
-                    vi = v[i]
-                    oi = omega[i]
+                    mi = atom.rmass[i]
+                    vi = atom.v[i]
+                    oi = atom.omega[i]
 
                     # Relative velocity at the contact point. The wall is
                     # stationary and has zero radius, so W = radi * omega_i;
@@ -263,9 +257,9 @@ class FixWallGranRegion(Fix):
                             ft = ti.min(fscrit, damp_t * vrel) / vrel
                         ft_vec = -ft * vrt
 
-                    f[i] += fntot * n_wall + ft_vec
+                    atom.f[i] += fntot * n_wall + ft_vec
                     # For a wall the moment arm is the full radius.
-                    torque[i] += -r_i * n_wall.cross(ft_vec)
+                    atom.torque[i] += -r_i * n_wall.cross(ft_vec)
                 else:
                     if ti.static(self.use_history == 1):
                         self.touch[i] = 0
@@ -292,11 +286,5 @@ class FixWallGranRegion(Fix):
             self.axis_hi,
             self.is_hertz,
             1 if self.history_update else 0,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
+            atom,
         )

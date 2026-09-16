@@ -112,7 +112,7 @@ class ContactHistory:
     @ti.kernel
     def restore_state_kernel(
         self,
-        tag: ti.template(),
+        atom: ti.template(),
         npairs: ti.template(),
         pair_i: ti.template(),
         pair_j: ti.template(),
@@ -120,7 +120,7 @@ class ContactHistory:
         """Repopulate every pair of the new neighbor list from the saved buffers."""
         for nc in range(npairs[None]):
             i = pair_i[nc]
-            jtag = tag[pair_j[nc]]
+            jtag = atom.tag[pair_j[nc]]
             found = -1
             for m in range(self.save_count[i]):
                 if self.save_tag[i, m] == jtag:
@@ -149,7 +149,7 @@ class ContactHistory:
         if atom.nlocal == 0:
             return
         self.restore_state_kernel(
-            atom.tag, nlist.npairs, nlist.pair_i, nlist.pair_j
+            atom, nlist.npairs, nlist.pair_i, nlist.pair_j
         )
         self.setup_pending = False
 

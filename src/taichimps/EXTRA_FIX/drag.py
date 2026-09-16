@@ -24,14 +24,13 @@ class FixDrag(Fix):
     def post_force_kernel(
         self,
         nlocal: ti.i32,
-        v: ti.template(),
-        f: ti.template(),
+        atom: ti.template(),
     ):
         f_val = ti.cast(self.f_drag, self.float_type)
         for i in range(nlocal):
-            f[i] -= f_val * v[i]
+            atom.f[i] -= f_val * atom.v[i]
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
             return
-        self.post_force_kernel(atom.nlocal, atom.v, atom.f)
+        self.post_force_kernel(atom.nlocal, atom)

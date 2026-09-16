@@ -86,8 +86,7 @@ class FixWave(Fix):
     def apply_force_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        f: ti.template(),
+        atom: ti.template(),
         val_x: ti.template(),
         val_y: ti.template(),
         val_z: ti.template(),
@@ -99,20 +98,19 @@ class FixWave(Fix):
         zhi: ti.template(),
     ):
         for i in range(nlocal):
-            px = x[i][0]
-            py = x[i][1]
-            pz = x[i][2]
+            px = atom.x[i][0]
+            py = atom.x[i][1]
+            pz = atom.x[i][2]
             if xlo <= px <= xhi and ylo <= py <= yhi and zlo <= pz <= zhi:
-                f[i][0] += val_x
-                f[i][1] += val_y
-                f[i][2] += val_z
+                atom.f[i][0] += val_x
+                atom.f[i][1] += val_y
+                atom.f[i][2] += val_z
 
     @ti.kernel
     def apply_velocity_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
+        atom: ti.template(),
         val_x: ti.template(),
         val_y: ti.template(),
         val_z: ti.template(),
@@ -124,13 +122,13 @@ class FixWave(Fix):
         zhi: ti.template(),
     ):
         for i in range(nlocal):
-            px = x[i][0]
-            py = x[i][1]
-            pz = x[i][2]
+            px = atom.x[i][0]
+            py = atom.x[i][1]
+            pz = atom.x[i][2]
             if xlo <= px <= xhi and ylo <= py <= yhi and zlo <= pz <= zhi:
-                v[i][0] = val_x
-                v[i][1] = val_y
-                v[i][2] = val_z
+                atom.v[i][0] = val_x
+                atom.v[i][1] = val_y
+                atom.v[i][2] = val_z
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
@@ -143,8 +141,7 @@ class FixWave(Fix):
         if self.mode == "force":
             self.apply_force_kernel(
                 atom.nlocal,
-                atom.x,
-                atom.f,
+                atom,
                 fx,
                 fy,
                 fz,
@@ -158,8 +155,7 @@ class FixWave(Fix):
         elif self.mode == "velocity":
             self.apply_velocity_kernel(
                 atom.nlocal,
-                atom.x,
-                atom.v,
+                atom,
                 fx,
                 fy,
                 fz,

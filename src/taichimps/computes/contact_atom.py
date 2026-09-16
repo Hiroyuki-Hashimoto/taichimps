@@ -21,8 +21,7 @@ class ComputeContactAtom:
     def compute_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        radius: ti.template(),
+        atom: ti.template(),
         num_neigh: ti.template(),
         neighbors: ti.template(),
         domain: ti.template(),
@@ -39,14 +38,14 @@ class ComputeContactAtom:
         # counting it only for the lower index returned exactly half the
         # coordination number.
         for i in range(nlocal):
-            xi = x[i]
-            ri = radius[i]
+            xi = atom.x[i]
+            ri = atom.radius[i]
             n_i = num_neigh[i]
             for k in range(n_i):
                 j = neighbors[i, k]
-                d = domain.minimum_image(xi - x[j])
+                d = domain.minimum_image(xi - atom.x[j])
                 rsq = d.dot(d)
-                radsum = ri + radius[j]
+                radsum = ri + atom.radius[j]
                 if rsq < radsum * radsum and rsq > 1e-18:
                     ti.atomic_add(self.contact_count[i], 1)
                     ti.atomic_add(self.contact_count[j], 1)
@@ -56,8 +55,7 @@ class ComputeContactAtom:
             return np.zeros(0, dtype=np.int32)
         self.compute_kernel(
             atom.nlocal,
-            atom.x,
-            atom.radius,
+            atom,
             neighbor.num_neighbors,
             neighbor.neighbors,
             domain,

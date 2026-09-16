@@ -53,14 +53,7 @@ class GranHooke(GranularPair):
     def compute_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
-        virial: ti.template(),
+        atom: ti.template(),
         npairs: ti.template(),
         pair_i: ti.template(),
         pair_j: ti.template(),
@@ -72,16 +65,16 @@ class GranHooke(GranularPair):
         for nc in range(npairs[None]):
             i = pair_i[nc]
             j = pair_j[nc]
-            xi = x[i]
-            vi = v[i]
-            ri = radius[i]
-            mi = rmass[i]
-            oi = omega[i]
-            xj = x[j]
-            vj = v[j]
-            rj = radius[j]
-            mj = rmass[j]
-            oj = omega[j]
+            xi = atom.x[i]
+            vi = atom.v[i]
+            ri = atom.radius[i]
+            mi = atom.rmass[i]
+            oi = atom.omega[i]
+            xj = atom.x[j]
+            vj = atom.v[j]
+            rj = atom.radius[j]
+            mj = atom.rmass[j]
+            oj = atom.omega[j]
 
             dpos, dvj = self.domain.minimum_image_and_vshift(xi - xj)
             rsq = dpos.dot(dpos)
@@ -139,15 +132,15 @@ class GranHooke(GranularPair):
                 fs_vec = -ft * vtr
                 f_total = dpos * ccel + fs_vec
 
-                ti.atomic_add(f[i], f_total)
-                ti.atomic_add(f[j], -f_total)
+                ti.atomic_add(atom.f[i], f_total)
+                ti.atomic_add(atom.f[j], -f_total)
 
                 # LAMMPS torque calculation:
                 # tor1 = rinv * (dely*fs3 - delz*fs2); ...
                 # tor = rinv * (dpos x fs_vec)
                 tor = rinv * dpos.cross(fs_vec)
-                ti.atomic_add(torque[i], -ri * tor)
-                ti.atomic_add(torque[j], -rj * tor)
+                ti.atomic_add(atom.torque[i], -ri * tor)
+                ti.atomic_add(atom.torque[j], -rj * tor)
 
                 # Pairwise virial, as in Pair::ev_tally_xyz()
                 vir = 0.5 * ti.Vector([
@@ -158,8 +151,8 @@ class GranHooke(GranularPair):
                     dpos[0] * f_total[2],
                     dpos[1] * f_total[2],
                 ])
-                ti.atomic_add(virial[i], vir)
-                ti.atomic_add(virial[j], vir)
+                ti.atomic_add(atom.virial[i], vir)
+                ti.atomic_add(atom.virial[j], vir)
 
     def compute(
         self,
@@ -173,14 +166,7 @@ class GranHooke(GranularPair):
             return
         self.compute_kernel(
             atom.nlocal,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
-            atom.virial,
+            atom,
             nlist.npairs,
             nlist.pair_i,
             nlist.pair_j,

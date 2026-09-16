@@ -74,10 +74,7 @@ class FixProbe(Fix):
     def sample_probes_kernel(
         self,
         nlocal: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        rmass: ti.template(),
-        radius: ti.template(),
+        atom: ti.template(),
         n_probes: ti.i32,
         probe_pos: ti.template(),
         probe_v: ti.template(),
@@ -92,14 +89,14 @@ class FixProbe(Fix):
             pos_p = probe_pos[p]
             r_sq_probe = probe_radius * probe_radius
             for i in range(nlocal):
-                diff = x[i] - pos_p
+                diff = atom.x[i] - pos_p
                 dist_sq = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]
                 if dist_sq <= r_sq_probe:
                     # Weighting by particle mass and cubic spline or linear weight
                     w = 1.0 - ti.sqrt(dist_sq) / probe_radius
-                    m = rmass[i]
+                    m = atom.rmass[i]
                     eff_w = w * m
-                    probe_v[p] += eff_w * v[i]
+                    probe_v[p] += eff_w * atom.v[i]
                     probe_weight[p] += eff_w
 
         for p in range(n_probes):
@@ -115,10 +112,7 @@ class FixProbe(Fix):
             return
         self.sample_probes_kernel(
             atom.nlocal,
-            atom.x,
-            atom.v,
-            atom.rmass,
-            atom.radius,
+            atom,
             self.n_probes,
             self.probe_pos,
             self.probe_v,

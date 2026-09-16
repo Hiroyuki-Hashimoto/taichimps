@@ -36,34 +36,28 @@ class FixDampingCundall(Fix):
     def post_force_kernel(
         self,
         nlocal: ti.i32,
-        v: ti.template(),
-        omega: ti.template(),
-        f: ti.template(),
-        torque: ti.template(),
+        atom: ti.template(),
         gamma_l: ti.template(),
         gamma_a: ti.template(),
     ):
         for i in range(nlocal):
             for d in ti.static(range(3)):
                 # Linear damping
-                work_lin = f[i][d] * v[i][d]
+                work_lin = atom.f[i][d] * atom.v[i][d]
                 sign_f = 1.0 if work_lin >= 0.0 else -1.0
-                f[i][d] *= 1.0 - gamma_l * sign_f
+                atom.f[i][d] *= 1.0 - gamma_l * sign_f
 
                 # Angular damping
-                work_ang = torque[i][d] * omega[i][d]
+                work_ang = atom.torque[i][d] * atom.omega[i][d]
                 sign_t = 1.0 if work_ang >= 0.0 else -1.0
-                torque[i][d] *= 1.0 - gamma_a * sign_t
+                atom.torque[i][d] *= 1.0 - gamma_a * sign_t
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
             return
         self.post_force_kernel(
             atom.nlocal,
-            atom.v,
-            atom.omega,
-            atom.f,
-            atom.torque,
+            atom,
             self.gamma_lin,
             self.gamma_ang,
         )

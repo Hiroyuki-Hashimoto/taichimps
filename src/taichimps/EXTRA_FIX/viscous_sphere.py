@@ -26,31 +26,23 @@ class FixViscousSphere(Fix):
     def post_force_kernel(
         self,
         nlocal: ti.i32,
-        v: ti.template(),
-        omega: ti.template(),
-        radius: ti.template(),
-        f: ti.template(),
-        torque: ti.template(),
+        atom: ti.template(),
     ):
         pi_val = math.pi
         gamma_val = ti.cast(self.gamma, self.float_type)
         for i in range(nlocal):
-            r = radius[i]
+            r = atom.radius[i]
             # Stokes drag: 6 * pi * mu * r
             drag_lin = 6.0 * pi_val * gamma_val * r
-            f[i] -= drag_lin * v[i]
+            atom.f[i] -= drag_lin * atom.v[i]
             # Stokes torque: 8 * pi * mu * r^3
             drag_rot = 8.0 * pi_val * gamma_val * (r * r * r)
-            torque[i] -= drag_rot * omega[i]
+            atom.torque[i] -= drag_rot * atom.omega[i]
 
     def post_force(self, atom: AtomSystem, dt: float) -> None:
         if atom.nlocal == 0:
             return
         self.post_force_kernel(
             atom.nlocal,
-            atom.v,
-            atom.omega,
-            atom.radius,
-            atom.f,
-            atom.torque,
+            atom,
         )

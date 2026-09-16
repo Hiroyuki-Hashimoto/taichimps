@@ -285,15 +285,7 @@ class PairGranular(GranularPair):
         nlocal: ti.template(),
         dt: ti.template(),
         history_update: ti.i32,
-        x: ti.template(),
-        v: ti.template(),
-        f: ti.template(),
-        omega: ti.template(),
-        torque: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
-        tag: ti.template(),
-        virial: ti.template(),
+        atom: ti.template(),
         npairs: ti.template(),
         pair_i: ti.template(),
         pair_j: ti.template(),
@@ -311,14 +303,14 @@ class PairGranular(GranularPair):
         for nc in range(npairs[None]):
             i = pair_i[nc]
             j = pair_j[nc]
-            xi = x[i]
-            vi = v[i]
-            ri = radius[i]
-            mi = rmass[i]
-            oi = omega[i]
-            rj = radius[j]
+            xi = atom.x[i]
+            vi = atom.v[i]
+            ri = atom.radius[i]
+            mi = atom.rmass[i]
+            oi = atom.omega[i]
+            rj = atom.radius[j]
             radsum = ri + rj
-            dpos, dvj = self.domain.minimum_image_and_vshift(xi - x[j])
+            dpos, dvj = self.domain.minimum_image_and_vshift(xi - atom.x[j])
             rsq = dpos.dot(dpos)
 
             if rsq < radsum * radsum and rsq > 1e-28:
@@ -327,16 +319,16 @@ class PairGranular(GranularPair):
                 n = dpos * rinv
                 delta = radsum - r
                 reff = (ri * rj) / radsum
-                meff = (mi * rmass[j]) / (mi + rmass[j])
+                meff = (mi * atom.rmass[j]) / (mi + atom.rmass[j])
                 # contact_radius = sqrt(dR), dR = delta * Reff
                 a = ti.sqrt(delta * reff)
 
                 # Under `remap v` the periodic image of j moves with the
                 # deforming lattice, so its velocity is offset.
-                vr = vi - (v[j] + dvj)
+                vr = vi - (atom.v[j] + dvj)
                 vnnr = vr.dot(n)
                 vt = vr - vnnr * n
-                wr = ri * oi + rj * omega[j]
+                wr = ri * oi + rj * atom.omega[j]
                 # GranularModel: cross3(wr, nx, temp); sub3(vt, temp, vtr)
                 vtr = vt - wr.cross(n)
                 vrel = vtr.norm()
@@ -380,7 +372,7 @@ class PairGranular(GranularPair):
                         ft = ti.min(fscrit, damp_t * vrel) / vrel
                     fs = -ft * vtr
                 elif ti.static(self.uses_history):
-                    jtag = tag[j]
+                    jtag = atom.tag[j]
                     hist = shear_hist[nc]
                     if partner_hist[nc] != jtag:
                         hist = ti.Vector([0.0, 0.0, 0.0])
@@ -413,13 +405,13 @@ class PairGranular(GranularPair):
 
                 f_total = fntot * n + fs
 
-                ti.atomic_add(f[i], f_total)
-                ti.atomic_add(f[j], -f_total)
+                ti.atomic_add(atom.f[i], f_total)
+                ti.atomic_add(atom.f[j], -f_total)
 
                 # torquesi/j = -(n x fs) * (rad - delta/2)
                 tor = -n.cross(fs)
-                ti.atomic_add(torque[i], (ri - 0.5 * delta) * tor)
-                ti.atomic_add(torque[j], (rj - 0.5 * delta) * tor)
+                ti.atomic_add(atom.torque[i], (ri - 0.5 * delta) * tor)
+                ti.atomic_add(atom.torque[j], (rj - 0.5 * delta) * tor)
 
                 # Pairwise virial, as in Pair::ev_tally_xyz()
                 vir = 0.5 * ti.Vector([
@@ -430,8 +422,8 @@ class PairGranular(GranularPair):
                     dpos[0] * f_total[2],
                     dpos[1] * f_total[2],
                 ])
-                ti.atomic_add(virial[i], vir)
-                ti.atomic_add(virial[j], vir)
+                ti.atomic_add(atom.virial[i], vir)
+                ti.atomic_add(atom.virial[j], vir)
             else:
                 if ti.static(self.uses_history):
                     partner_hist[nc] = -1
@@ -451,15 +443,7 @@ class PairGranular(GranularPair):
             atom.nlocal,
             dt,
             1 if shearupdate else 0,
-            atom.x,
-            atom.v,
-            atom.f,
-            atom.omega,
-            atom.torque,
-            atom.radius,
-            atom.rmass,
-            atom.tag,
-            atom.virial,
+            atom,
             nlist.npairs,
             nlist.pair_i,
             nlist.pair_j,

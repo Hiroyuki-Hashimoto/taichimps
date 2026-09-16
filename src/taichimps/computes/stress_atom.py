@@ -31,24 +31,22 @@ class ComputeStressAtom:
     def compute_stress_kernel(
         self,
         nlocal: ti.i32,
-        v: ti.template(),
-        rmass: ti.template(),
-        atom_virial: ti.template(),
+        atom: ti.template(),
         keflag: ti.i32,
     ):
         for k in ti.static(range(6)):
             self.macro_stress[k] = 0.0
 
         for i in range(nlocal):
-            s = -atom_virial[i]
+            s = -atom.virial[i]
             if keflag != 0:
-                m = rmass[i]
-                s[0] -= m * v[i][0] * v[i][0]
-                s[1] -= m * v[i][1] * v[i][1]
-                s[2] -= m * v[i][2] * v[i][2]
-                s[3] -= m * v[i][0] * v[i][1]
-                s[4] -= m * v[i][0] * v[i][2]
-                s[5] -= m * v[i][1] * v[i][2]
+                m = atom.rmass[i]
+                s[0] -= m * atom.v[i][0] * atom.v[i][0]
+                s[1] -= m * atom.v[i][1] * atom.v[i][1]
+                s[2] -= m * atom.v[i][2] * atom.v[i][2]
+                s[3] -= m * atom.v[i][0] * atom.v[i][1]
+                s[4] -= m * atom.v[i][0] * atom.v[i][2]
+                s[5] -= m * atom.v[i][1] * atom.v[i][2]
             self.stress[i] = s
             for k in ti.static(range(6)):
                 self.macro_stress[k] += s[k]
@@ -69,9 +67,7 @@ class ComputeStressAtom:
             return np.zeros((0, 6), dtype=np.float64)
         self.compute_stress_kernel(
             atom.nlocal,
-            atom.v,
-            atom.rmass,
-            atom.virial,
+            atom,
             1 if kinetic else 0,
         )
         return self.stress.to_numpy()[: atom.nlocal]

@@ -47,28 +47,23 @@ class Computes:
     def compute_ke_kernel(
         self,
         nlocal: ti.template(),
-        v: ti.template(),
-        omega: ti.template(),
-        radius: ti.template(),
-        rmass: ti.template(),
+        atom: ti.template(),
     ):
         self.ke_trans_val[None] = 0.0
         self.ke_rot_val[None] = 0.0
         for i in range(nlocal):
-            vsq = v[i].dot(v[i])
-            self.ke_trans_val[None] += 0.5 * rmass[i] * vsq
+            vsq = atom.v[i].dot(atom.v[i])
+            self.ke_trans_val[None] += 0.5 * atom.rmass[i] * vsq
 
-            i_moment = 0.4 * rmass[i] * radius[i] * radius[i]
-            wsq = omega[i].dot(omega[i])
+            i_moment = 0.4 * atom.rmass[i] * atom.radius[i] * atom.radius[i]
+            wsq = atom.omega[i].dot(atom.omega[i])
             self.ke_rot_val[None] += 0.5 * i_moment * wsq
 
     @ti.kernel
     def compute_virial_kernel(
         self,
         nlocal: ti.template(),
-        v: ti.template(),
-        rmass: ti.template(),
-        atom_virial: ti.template(),
+        atom: ti.template(),
         keflag: ti.i32,
         chunks: ti.template(),
     ):
@@ -95,15 +90,15 @@ class Computes:
             acc = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dt=self.float_type)
             i = c
             while i < nlocal:
-                acc += atom_virial[i]
+                acc += atom.virial[i]
                 if keflag != 0:
-                    m = rmass[i]
-                    acc[0] += m * v[i][0] * v[i][0]
-                    acc[1] += m * v[i][1] * v[i][1]
-                    acc[2] += m * v[i][2] * v[i][2]
-                    acc[3] += m * v[i][0] * v[i][1]
-                    acc[4] += m * v[i][0] * v[i][2]
-                    acc[5] += m * v[i][1] * v[i][2]
+                    m = atom.rmass[i]
+                    acc[0] += m * atom.v[i][0] * atom.v[i][0]
+                    acc[1] += m * atom.v[i][1] * atom.v[i][1]
+                    acc[2] += m * atom.v[i][2] * atom.v[i][2]
+                    acc[3] += m * atom.v[i][0] * atom.v[i][1]
+                    acc[4] += m * atom.v[i][0] * atom.v[i][2]
+                    acc[5] += m * atom.v[i][1] * atom.v[i][2]
                 i += chunks
             self.virial_partial[c] = acc
 
@@ -119,10 +114,7 @@ class Computes:
             return 0.0
         self.compute_ke_kernel(
             atom.nlocal,
-            atom.v,
-            atom.omega,
-            atom.radius,
-            atom.rmass,
+            atom,
         )
         return float(self.ke_trans_val[None])
 
@@ -132,10 +124,7 @@ class Computes:
             return 0.0
         self.compute_ke_kernel(
             atom.nlocal,
-            atom.v,
-            atom.omega,
-            atom.radius,
-            atom.rmass,
+            atom,
         )
         return float(self.ke_rot_val[None])
 
@@ -145,10 +134,7 @@ class Computes:
             return 0.0
         self.compute_ke_kernel(
             atom.nlocal,
-            atom.v,
-            atom.omega,
-            atom.radius,
-            atom.rmass,
+            atom,
         )
         return float(self.ke_trans_val[None] + self.ke_rot_val[None])
 
@@ -177,9 +163,7 @@ class Computes:
             return np.zeros(6, dtype=np.float64)
         self.compute_virial_kernel(
             atom.nlocal,
-            atom.v,
-            atom.rmass,
-            atom.virial,
+            atom,
             1 if kinetic else 0,
             virial_chunks(atom.nlocal),
         )
@@ -199,12 +183,12 @@ class Computes:
         m = atom.rmass.to_numpy()[:n]
         mv = m[:, None] * v
         return np.array([
-            float(np.sum(mv[:, 0] * v[:, 0])),
-            float(np.sum(mv[:, 1] * v[:, 1])),
-            float(np.sum(mv[:, 2] * v[:, 2])),
-            float(np.sum(mv[:, 0] * v[:, 1])),
-            float(np.sum(mv[:, 0] * v[:, 2])),
-            float(np.sum(mv[:, 1] * v[:, 2])),
+            float(np.sum(mv[:, 0] * atom.v[:, 0])),
+            float(np.sum(mv[:, 1] * atom.v[:, 1])),
+            float(np.sum(mv[:, 2] * atom.v[:, 2])),
+            float(np.sum(mv[:, 0] * atom.v[:, 1])),
+            float(np.sum(mv[:, 0] * atom.v[:, 2])),
+            float(np.sum(mv[:, 1] * atom.v[:, 2])),
         ])
 
     def temperature(self, atom: AtomSystem) -> float:
