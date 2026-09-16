@@ -177,9 +177,16 @@ class ContactAtomCompute(BaseCompute):
 
     def __init__(self, compute_id: str) -> None:
         super().__init__(compute_id, "contact/atom")
-        self._impl = ComputeContactAtom()
+        self._impl: ComputeContactAtom | None = None
 
     def per_atom(self, ctx: ComputeContext) -> np.ndarray:
+        # Sized from the atom count, as StressAtomCompute already does.
+        # The default this used to take was two million, which wasted 8 MB
+        # on every run and, worse, would have let a larger system write
+        # past the end of contact_count -- the kernel tallies both
+        # partners of every pair by index, with no bound of its own.
+        if self._impl is None:
+            self._impl = ComputeContactAtom(max_atoms=ctx.atom.max_atoms)
         return self._impl.compute(ctx.atom, ctx.domain, ctx.neighbor).astype(np.float64)
 
 

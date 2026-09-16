@@ -236,7 +236,7 @@ def test_input_parser_wall_gran_region(tmp_path):
     """
     script_file.write_text(script)
 
-    parser = LAMMPSInputParser(script_file)
+    parser = LAMMPSInputParser(script_file, default_fp=ti.f64, arch=ti.cpu)
     parser.execute()
 
     assert "1" in parser.fixes
@@ -266,7 +266,7 @@ def test_input_parser_wall_gran_cylinder_direct(tmp_path):
     """
     script_file.write_text(script)
 
-    parser = LAMMPSInputParser(script_file)
+    parser = LAMMPSInputParser(script_file, default_fp=ti.f64, arch=ti.cpu)
     parser.execute()
 
     assert "2" in parser.fixes

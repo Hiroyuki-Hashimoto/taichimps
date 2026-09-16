@@ -37,7 +37,7 @@ run 5
         script_path = f.name
 
     try:
-        parser = LAMMPSInputParser(Path(script_path))
+        parser = LAMMPSInputParser(Path(script_path), default_fp=ti.f64, arch=ti.cpu)
         parser.execute()
 
         sim = parser.simulation

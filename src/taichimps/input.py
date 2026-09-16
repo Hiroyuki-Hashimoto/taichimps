@@ -48,6 +48,26 @@ class LAMMPSInputParser:
     """Parses and executes a LAMMPS input script in taichimps."""
 
     def __init__(self, script_path: str | Path, default_fp=None, arch=None) -> None:
+        """
+        `arch` and `default_fp` are required.
+
+        They used to default to `ti.cpu` and Taichi's own f32, and execute()
+        applied them by calling ti.init() -- which silently overrode whatever
+        the caller had already initialised.  A script launched as
+
+            ti.init(arch=ti.cuda, default_fp=ti.f64)
+            LAMMPSInputParser(path).execute()
+
+        therefore ran on the CPU in single precision, several times slower and
+        to a different answer, with nothing in the output to say so.  Demanding
+        both makes that impossible to do by accident.
+        """
+        if arch is None or default_fp is None:
+            raise ValueError(
+                "LAMMPSInputParser needs arch and default_fp: execute() calls "
+                "ti.init() with them, replacing any Taichi already running. "
+                "Pass e.g. arch=ti.cuda, default_fp=ti.f64."
+            )
         self.script_path = Path(script_path)
         self.workdir = self.script_path.parent
         self.variables: dict[str, Any] = {}
@@ -77,6 +97,11 @@ class LAMMPSInputParser:
         self.dt: float = 1e-4
         self.thermo_freq: int = 100
         self.pair_style: Any = None
+        # Which pair_style is in force.  `pair granular` takes its whole
+        # model specification through pair_coeff, while the legacy gran/*
+        # styles take everything on the pair_style line and accept only a
+        # bare `pair_coeff * *`, so pair_coeff has to know which it is.
+        self.pair_style_name: str = ""
         self.fixes: dict[str, Any] = {}
         self.dumps: dict[str, Any] = {}
         self.regions: dict[str, Any] = {}
@@ -107,10 +132,20 @@ class LAMMPSInputParser:
         def sub_var(match: re.Match) -> str:
             var_name = match.group(1)
             if var_name in self.variable_exprs:
+                # An equal-style variable that will not evaluate is an error,
+                # not something to paper over.  Falling through to the stored
+                # value used to write the expression itself into the output --
+                # `ex_ey_ez_evol.txt` came out full of the text
+                # "(v_lx0 - lx) / v_lx0" instead of strains, with the right
+                # number of rows and the right timesteps, so nothing looked
+                # wrong until the file was opened.
                 try:
                     return f"{self.evaluate_variable(var_name):.15g}"
-                except (ValueError, KeyError):
-                    pass
+                except (ValueError, KeyError) as exc:
+                    raise ValueError(
+                        f"variable {var_name!r} could not be evaluated: "
+                        f"{self.variable_exprs[var_name]!r} ({exc})"
+                    ) from exc
             val = self.variables.get(var_name, "")
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 return f"{float(val):.15g}"
@@ -789,14 +824,10 @@ class LAMMPSInputParser:
 
     def execute(self) -> None:
         """Executes commands in sequence."""
-        target_arch = self.arch if self.arch is not None else ti.cpu
-        try:
-            if self.default_fp is not None:
-                ti.init(arch=target_arch, default_fp=self.default_fp)
-            else:
-                ti.init(arch=target_arch)
-        except RuntimeError:
-            pass
+        # Not guarded: a Taichi that will not start is fatal, and swallowing
+        # the error here left the run to proceed on whatever backend happened
+        # to be active.
+        ti.init(arch=self.arch, default_fp=self.default_fp)
 
         for raw_cmd in self.commands:
             tokens = self.parse_line(raw_cmd)
@@ -1032,6 +1063,7 @@ class LAMMPSInputParser:
 
             elif cmd == "pair_style":
                 style_name = args[0]
+                self.pair_style_name = style_name
                 if self.domain is None:
                     continue
                 if style_name in ("gran/hertz/history", "gran/hooke/history", "gran/hooke"):
@@ -1063,6 +1095,18 @@ class LAMMPSInputParser:
 
             elif cmd == "pair_coeff":
                 if self.domain is None:
+                    continue
+                if self.pair_style_name != "granular":
+                    # The legacy gran/* styles carry every coefficient on the
+                    # pair_style line; PairGranHookeHistory::coeff() rejects
+                    # anything past `* *`.  So this line says only "all type
+                    # pairs interact", which is already the case, and building
+                    # a pair granular model out of it would throw the real one
+                    # away.
+                    if len(args) > 2:
+                        raise ValueError(
+                            f"pair_coeff for pair_style {self.pair_style_name} "
+                            "takes no coefficients; write `pair_coeff * *`")
                     continue
                 self.pair_style = self._parse_pair_coeff_granular(args)
                 if self.simulation is not None:
@@ -1654,9 +1698,10 @@ class LAMMPSInputParser:
 LammpsInputParser = LAMMPSInputParser
 
 
-def parse_and_run(script_path: str | Path) -> Simulation | None:
+def parse_and_run(script_path: str | Path, default_fp=ti.f64,
+                  arch=ti.cpu) -> Simulation | None:
     """Parse and run a LAMMPS script."""
-    parser = LAMMPSInputParser(script_path)
+    parser = LAMMPSInputParser(script_path, default_fp=default_fp, arch=arch)
     parser.execute()
     return parser.simulation
 

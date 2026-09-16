@@ -10,7 +10,7 @@ def test_isotropic_run():
     if not script_path.exists():
         return
     ti.init(arch=ti.cpu)
-    parser = LAMMPSInputParser(script_path)
+    parser = LAMMPSInputParser(script_path, default_fp=ti.f64, arch=ti.cpu)
     parser.execute()
 
     assert parser.simulation is not None

@@ -57,7 +57,7 @@ def test_pair_style_granular_is_parsed(tmp_path):
     script = tmp_path / "in.granular"
     script.write_text(SCRIPT)
 
-    parser = LAMMPSInputParser(script)
+    parser = LAMMPSInputParser(script, default_fp=ti.f64, arch=ti.cpu)
     parser.execute()
 
     pair = parser.pair_style
@@ -93,6 +93,6 @@ def test_unsupported_submodel_is_rejected(tmp_path):
         "pair_style granular\n"
         "pair_coeff * * jkr 1e9 0.95 0.23 0.1 tangential mindlin NULL 1.0 0.3\n"
     )
-    parser = LAMMPSInputParser(script)
+    parser = LAMMPSInputParser(script, default_fp=ti.f64, arch=ti.cpu)
     with pytest.raises(ValueError, match="jkr"):
         parser.execute()

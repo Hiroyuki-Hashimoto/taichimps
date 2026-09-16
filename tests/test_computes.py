@@ -112,7 +112,7 @@ def _run_parser(tmp_path, cfg) -> LAMMPSInputParser:
     _write_data(tmp_path / "data.in", cfg)
     script = tmp_path / "in.computes"
     script.write_text(SCRIPT)
-    parser = LAMMPSInputParser(script)
+    parser = LAMMPSInputParser(script, default_fp=ti.f64, arch=ti.cpu)
     parser.execute()
     parser.update_dynamic_variables()
     return parser
@@ -153,7 +153,7 @@ def test_unknown_compute_style_is_rejected(tmp_path):
         "units si\nboundary p p p\natom_style sphere\nread_data data.in\n"
         "compute 9 all rdf 100\n"
     )
-    parser = LAMMPSInputParser(script)
+    parser = LAMMPSInputParser(script, default_fp=ti.f64, arch=ti.cpu)
     with pytest.raises(ValueError, match="rdf"):
         parser.execute()
 

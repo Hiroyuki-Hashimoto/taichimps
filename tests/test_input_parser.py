@@ -1,4 +1,5 @@
 from pathlib import Path
+import taichi as ti
 
 from taichimps.input import LAMMPSInputParser
 
@@ -11,7 +12,7 @@ variable Gshear equal 29.1e9
 variable kn equal 4.0*${Gshear}/(3*(1-${Poi}))
 variable kt equal ${kn}*2*(1-${Poi})/(2-${Poi})
 """)
-    parser = LAMMPSInputParser(p)
+    parser = LAMMPSInputParser(p, default_fp=ti.f64, arch=ti.cpu)
     parser.load_script()
     for cmd in parser.commands:
         tokens = parser.parse_line(cmd)

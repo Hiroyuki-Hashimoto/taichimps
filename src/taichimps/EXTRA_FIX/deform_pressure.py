@@ -491,7 +491,7 @@ class FixDeformPressure(Fix):
     # ------------------------------------------------------------------ kernel
 
     @ti.kernel
-    def remap_positions(self, nlocal: ti.i32, x: ti.template()):
+    def remap_positions(self, nlocal: ti.template(), atom: ti.template()):
         """
         Affine remap, the lamda-coordinate round trip LAMMPS performs.
 
@@ -500,22 +500,30 @@ class FixDeformPressure(Fix):
         box length.  Anchoring on the new lower bound matters: anchoring on the
         old one (as this used to) leaves the particles displaced from the box by
         half the box-length change on every single update.
-        """
-        old_lo = self._old_lo[None]
-        new_lo = self._new_lo[None]
-        oprd = self._old_prd[None]
-        ohinv = self._old_hinv_tilt[None]  # [h_inv5, h_inv4, h_inv3]
-        nprd = self._new_prd[None]
-        nt = self._new_tilt[None]          # [xy, xz, yz]
 
+        The six box vectors are read inside the loop rather than above it.  At
+        kernel scope they become a serial prologue whose results have to reach
+        the parallel loop through a temporary, and with a run-time loop bound
+        that pairing miscompiled on CUDA: the kernel wrote outside its fields
+        and the next synchronisation failed with CUDA_ERROR_MISALIGNED_ADDRESS.
+        Inside the loop this is one parallel launch reading six addresses that
+        every thread shares, so it is also cheaper.
+        """
         for i in range(nlocal):
-            d = x[i] - old_lo
+            old_lo = self._old_lo[None]
+            new_lo = self._new_lo[None]
+            oprd = self._old_prd[None]
+            ohinv = self._old_hinv_tilt[None]  # [h_inv5, h_inv4, h_inv3]
+            nprd = self._new_prd[None]
+            nt = self._new_tilt[None]          # [xy, xz, yz]
+
+            d = atom.x[i] - old_lo
             lam = ti.Vector([
                 d[0] / oprd[0] + ohinv[0] * d[1] + ohinv[1] * d[2],
                 d[1] / oprd[1] + ohinv[2] * d[2],
                 d[2] / oprd[2],
             ])
-            x[i] = ti.Vector([
+            atom.x[i] = ti.Vector([
                 nprd[0] * lam[0] + nt[0] * lam[1] + nt[1] * lam[2] + new_lo[0],
                 nprd[1] * lam[1] + nt[2] * lam[2] + new_lo[1],
                 nprd[2] * lam[2] + new_lo[2],
@@ -1200,7 +1208,7 @@ class FixDeformPressure(Fix):
             # Deform the atoms onto the un-flipped cell; the flip below is a
             # relabelling that must leave them where they are.
             self._new_tilt[None] = ti.Vector(deformed_tilt.tolist())
-            self.remap_positions(atom.nlocal, atom.x)
+            self.remap_positions(atom.nlocal, atom)
 
         dom.set_box_and_h_rate(
             new_lo.tolist(), new_hi.tolist(), new_tilt.tolist(),
